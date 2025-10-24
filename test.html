@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>RoamFlow Test</title>
+</head>
+<body>
+  <h1>RoamFlow Test Page</h1>
+
+  <div style="padding: 20px;">
+    <h2>Sample TODOs</h2>
+    <div class="rm-block">
+      <div class="check-container">
+        <input type="checkbox" id="task1">
+      </div>
+      <div class="rm-block__input" id="block-input-test-uid-1">
+        {{[[TODO]]}} Review legal brief
+        <div class="rm-block-children">
+          <div class="rm-block">
+            Deadline:: [[December 25th, 2024]]
+          </div>
+          <div class="rm-block">
+            Scheduled:: [[December 20th, 2024]]
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="rm-block">
+      <div class="check-container">
+        <input type="checkbox" id="task2">
+      </div>
+      <div class="rm-block__input" id="block-input-test-uid-2">
+        {{[[TODO]]}} File court documents
+        <div class="rm-block-children">
+          <div class="rm-block">
+            Deadline:: [[October 25th, 2024]]
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script type="module" src="./dist/roamflow.js"></script>
+
+  <script>
+    // Mock Roam API for testing
+    window.roamAlphaAPI = {
+      ui: {
+        commandPalette: {
+          addCommand: (cmd) => {
+            console.log('Command registered:', cmd.label);
+          }
+        },
+        rightSidebar: {
+          addWindow: (opts) => console.log('Open sidebar:', opts),
+          open: () => console.log('Sidebar opened')
+        }
+      }
+    };
+
+    setTimeout(() => {
+      console.log('RoamFlow loaded:', window.RoamFlow);
+      console.log('Try: window.RoamFlow.getTasks()');
+    }, 2000);
+  </script>
+</body>
+</html>
