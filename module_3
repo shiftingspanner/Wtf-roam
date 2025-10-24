@@ -1,0 +1,1303 @@
+/**
+ * Module 3: Task Detection & State (COMPLETE)
+ * 
+ * Passive, on-demand task detection system for RoamFlow.
+ * Uses DOM-first approach with conservative API usage to avoid timeouts.
+ * Integrates with Module 2's time block system for legal practice optimization.
+ * 
+ * Philosophy: Work with what's visible, query only when needed.
+ * Initial refresh: 100 tasks, default range: this week + next week
+ */
+
+(() => {
+  'use strict';
+
+  // Ensure Module 2 is available
+  if (!window.RoamFlow?.TimeBlockSystem) {
+    console.error('Module 3 requires Module 2: Time Block System');
+    return;
+  }
+
+  const TimeBlockSystem = window.RoamFlow.TimeBlockSystem;
+  const Foundation = window.RoamFlow.Foundation;
+
+  // =============================================================================
+  // CONSTANTS AND CONFIGURATION
+  // =============================================================================
+
+  const CONFIG = {
+    INITIAL_TASK_LIMIT: 100,           // Initial refresh gets 100 tasks
+    PROGRESSIVE_LOAD_SIZE: 20,         // "Show 20 more" increments
+    CACHE_DURATION: 5 * 60 * 1000,     // 5 minutes cache
+    DEFAULT_WEEKS_AHEAD: 1,            // This week + next week (1 week ahead)
+    DEFAULT_WEEKS_BEHIND: 0,           // Current week only (no past weeks)
+    MAX_QUERY_RETRIES: 2,
+    DOM_PARSE_DEBOUNCE: 500           // ms to debounce DOM changes
+  };
+
+  const TASK_PATTERNS = {
+    TODO: /\{\{\[\[TODO\]\]\}\}/g,
+    DONE: /\{\{\[\[DONE\]\]\}\}/g,
+    SMARTBLOCK_TODO: /\{\{TODO\}\}/g,
+    SMARTBLOCK_DONE: /\{\{DONE\}\}/g
+  };
+
+  const LEGAL_CONTEXT_PATTERNS = {
+    evidence: /#\.?evidence|#\.?Evidence|evidence|Evidence/i,
+    drafting: /#\.?drafting|#\.?Drafting|drafting|Drafting/i,
+    supervision: /#\.?supervision|#\.?Supervision|supervision|Supervision/i,
+    logistics: /#\.?logistics|#\.?Logistics|logistics|Logistics/i,
+    'practice-management': /#\.?practice.?management|#\.?Practice.?Management/i,
+    'client-contact': /#\.?client.?contact|#\.?Client.?Contact/i,
+    finalising: /#\.?finalising|#\.?Finalising|finalising|Finalising/i
+  };
+
+  const CASE_PATTERN = /\[\[Case\/[\w-]+\]\]/g;
+  const DEADLINE_PATTERN = /Deadline::\s*\[\[([^\]]+)\]\]/i;
+  const PRIORITY_PATTERN = /Priority::\s*(\d+)/i;
+
+  // =============================================================================
+  // CACHE MANAGEMENT
+  // =============================================================================
+
+  class TaskCache {
+    constructor() {
+      this.cache = new Map();
+      this.timestamps = new Map();
+    }
+
+    set(key, data) {
+      this.cache.set(key, data);
+      this.timestamps.set(key, Date.now());
+    }
+
+    get(key) {
+      const timestamp = this.timestamps.get(key);
+      if (!timestamp || Date.now() - timestamp > CONFIG.CACHE_DURATION) {
+        this.delete(key);
+        return null;
+      }
+      return this.cache.get(key);
+    }
+
+    delete(key) {
+      this.cache.delete(key);
+      this.timestamps.delete(key);
+    }
+
+    clear() {
+      this.cache.clear();
+      this.timestamps.clear();
+    }
+
+    getAge(key) {
+      const timestamp = this.timestamps.get(key);
+      return timestamp ? Date.now() - timestamp : null;
+    }
+
+    isExpired(key) {
+      const age = this.getAge(key);
+      return !age || age > CONFIG.CACHE_DURATION;
+    }
+  }
+
+  const taskCache = new TaskCache();
+
+  // =============================================================================
+  // DATE UTILITIES FOR TASK QUERIES
+  // =============================================================================
+
+  /**
+   * Get week start and end dates for task filtering
+   * @param {number} weeksOffset - Offset from current week (0 = this week, 1 = next week, -1 = last week)
+   * @returns {Object} Start and end date objects
+   */
+  function getWeekRange(weeksOffset = 0) {
+    const now = new Date();
+    const dayOfWeek = now.getDay(); // 0 = Sunday, 1 = Monday, etc.
+    const mondayOffset = dayOfWeek === 0 ? -6 : 1 - dayOfWeek; // Adjust to Monday start
+    
+    const weekStart = new Date(now);
+    weekStart.setDate(now.getDate() + mondayOffset + (weeksOffset * 7));
+    weekStart.setHours(0, 0, 0, 0);
+    
+    const weekEnd = new Date(weekStart);
+    weekEnd.setDate(weekStart.getDate() + 6);
+    weekEnd.setHours(23, 59, 59, 999);
+    
+    return { start: weekStart, end: weekEnd };
+  }
+
+  /**
+   * Get default task query time range (this week + next week)
+   * @returns {Object} Start and end dates for default query
+   */
+  function getDefaultTimeRange() {
+    const thisWeek = getWeekRange(0);
+    const nextWeek = getWeekRange(CONFIG.DEFAULT_WEEKS_AHEAD);
+    
+    return {
+      start: thisWeek.start,
+      end: nextWeek.end
+    };
+  }
+
+  /**
+   * Format date for Roam page title
+   * @param {Date} date - Date to format
+   * @returns {string} Roam-formatted date
+   */
+  function formatDateForRoam(date) {
+    if (window.roamAlphaAPI?.util?.dateToPageTitle) {
+      return window.roamAlphaAPI.util.dateToPageTitle(date);
+    }
+    
+    // Fallback formatting
+    const months = ['January', 'February', 'March', 'April', 'May', 'June',
+                   'July', 'August', 'September', 'October', 'November', 'December'];
+    const day = date.getDate();
+    const month = months[date.getMonth()];
+    const year = date.getFullYear();
+    
+    const suffix = day % 10 === 1 && day !== 11 ? 'st' :
+                   day % 10 === 2 && day !== 12 ? 'nd' :
+                   day % 10 === 3 && day !== 13 ? 'rd' : 'th';
+    
+    return `${month} ${day}${suffix}, ${year}`;
+  }
+
+  // =============================================================================
+  // DOM-BASED TASK DETECTION (PRIMARY METHOD)
+  // =============================================================================
+
+  /**
+   * Parse tasks from currently visible DOM elements
+   * @returns {Array} Array of task objects found in DOM
+   */
+  function getVisibleTasks() {
+    const visibleTasks = [];
+    
+    try {
+      // Find all block text elements that might contain tasks
+      const blockElements = Array.from(document.querySelectorAll('.rm-block-text'));
+      
+      blockElements.forEach(element => {
+        const blockText = element.textContent || '';
+        const task = parseTaskFromText(blockText, element);
+        
+        if (task) {
+          // Try to get block UID from DOM structure
+          const blockContainer = element.closest('.roam-block') || element.closest('.rm-block__input');
+          if (blockContainer) {
+            task.blockUID = extractBlockUIDFromElement(blockContainer);
+            task.source = 'dom';
+            visibleTasks.push(task);
+          }
+        }
+      });
+      
+      console.log(`Found ${visibleTasks.length} visible tasks via DOM parsing`);
+      return visibleTasks;
+    } catch (error) {
+      console.error('Error parsing visible tasks from DOM:', error);
+      return [];
+    }
+  }
+
+  /**
+   * Extract block UID from DOM element
+   * @param {Element} element - DOM element to extract UID from
+   * @returns {string|null} Block UID or null if not found
+   */
+  function extractBlockUIDFromElement(element) {
+    try {
+      // Check for data attributes
+      if (element.dataset?.blockUid) {
+        return element.dataset.blockUid;
+      }
+      
+      // Check ID patterns
+      const id = element.id || '';
+      const uidMatch = id.match(/(?:block|bullet)-(.+)$/);
+      if (uidMatch && uidMatch[1]) {
+        return uidMatch[1];
+      }
+      
+      // Look for UID in class names or other attributes
+      const classes = element.className || '';
+      const classUidMatch = classes.match(/block-([a-zA-Z0-9_-]+)/);
+      if (classUidMatch && classUidMatch[1]) {
+        return classUidMatch[1];
+      }
+      
+      return null;
+    } catch (error) {
+      console.error('Error extracting block UID:', error);
+      return null;
+    }
+  }
+
+  /**
+   * Parse task from text content
+   * @param {string} blockText - Text content to parse
+   * @param {Element} element - DOM element for additional context
+   * @returns {Object|null} Parsed task object or null
+   */
+  function parseTaskFromText(blockText, element = null) {
+    if (!blockText || typeof blockText !== 'string') {
+      return null;
+    }
+    
+    // Check if text contains task patterns
+    const isTodo = TASK_PATTERNS.TODO.test(blockText) || TASK_PATTERNS.SMARTBLOCK_TODO.test(blockText);
+    const isDone = TASK_PATTERNS.DONE.test(blockText) || TASK_PATTERNS.SMARTBLOCK_DONE.test(blockText);
+    
+    if (!isTodo && !isDone) {
+      return null;
+    }
+    
+    try {
+      // Extract task components
+      const cleanText = blockText
+        .replace(TASK_PATTERNS.TODO, '')
+        .replace(TASK_PATTERNS.DONE, '')
+        .replace(TASK_PATTERNS.SMARTBLOCK_TODO, '')
+        .replace(TASK_PATTERNS.SMARTBLOCK_DONE, '')
+        .trim();
+      
+      // Check if this is a time block task (from Module 2)
+      const isTimeBlockTask = TimeBlockSystem.isTimeBlock(blockText);
+      let timeBlockData = null;
+      
+      if (isTimeBlockTask) {
+        try {
+          timeBlockData = TimeBlockSystem.parseTimeBlockFromText(blockText);
+        } catch (e) {
+          console.warn('Failed to parse time block:', e.message);
+        }
+      }
+      
+      // Extract metadata
+      const caseMatches = blockText.match(CASE_PATTERN);
+      const deadlineMatch = blockText.match(DEADLINE_PATTERN);
+      const priorityMatch = blockText.match(PRIORITY_PATTERN);
+      
+      // Detect context from text patterns
+      const detectedContext = detectContextFromText(blockText);
+      
+      // Try to get page context
+      const pageContext = getPageContextFromElement(element);
+      
+      const task = {
+        id: null, // Will be set from blockUID
+        title: cleanText,
+        completed: isDone,
+        isTimeBlock: isTimeBlockTask,
+        timeBlockData: timeBlockData,
+        caseReference: caseMatches ? caseMatches[0] : null,
+        deadline: deadlineMatch ? deadlineMatch[1] : null,
+        priority: priorityMatch ? parseInt(priorityMatch[1]) : null,
+        context: timeBlockData?.context || detectedContext,
+        pageTitle: pageContext?.title,
+        pageUID: pageContext?.uid,
+        rawText: blockText,
+        source: 'dom',
+        created: new Date().toISOString(), // Approximate, real creation time would need API
+        lastModified: new Date().toISOString()
+      };
+      
+      return task;
+    } catch (error) {
+      console.error('Error parsing task from text:', error);
+      return null;
+    }
+  }
+
+  /**
+   * Detect legal context from text patterns
+   * @param {string} text - Text to analyze
+   * @returns {string|null} Detected context or null
+   */
+  function detectContextFromText(text) {
+    for (const [context, pattern] of Object.entries(LEGAL_CONTEXT_PATTERNS)) {
+      if (pattern.test(text)) {
+        return context;
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Get page context from DOM element
+   * @param {Element} element - DOM element to get page context from
+   * @returns {Object|null} Page context with title and UID
+   */
+  function getPageContextFromElement(element) {
+    if (!element) return null;
+    
+    try {
+      // Look for page title in DOM hierarchy
+      const pageContainer = element.closest('.roam-article') || element.closest('.rm-article-wrapper');
+      if (pageContainer) {
+        const titleElement = pageContainer.querySelector('.rm-title-display') || 
+                           pageContainer.querySelector('.rm-title-textarea') ||
+                           pageContainer.querySelector('h1');
+        
+        if (titleElement) {
+          return {
+            title: titleElement.textContent?.trim() || null,
+            uid: null // Would need API call to get UID
+          };
+        }
+      }
+      
+      return null;
+    } catch (error) {
+      console.error('Error getting page context:', error);
+      return null;
+    }
+  }
+
+  // =============================================================================
+  // API-BASED TASK DETECTION (SECONDARY METHOD)
+  // =============================================================================
+
+  /**
+   * Query tasks using Roam API with time range filter
+   * @param {Object} options - Query options
+   * @returns {Array} Array of task objects
+   */
+async function queryTasksFromAPI(options = {}) {
+  const {
+    limit = CONFIG.INITIAL_TASK_LIMIT,
+    timeRange = getDefaultTimeRange(),
+    contextFilter = null,
+    pageFilter = null,
+    completedOnly = null,
+    caseFilter = null
+  } = options;
+  
+  const cacheKey = JSON.stringify({ ...options, timeRange: null }) + '_' + 
+                   timeRange.start.toISOString() + '_' + timeRange.end.toISOString();
+  
+  // Check cache first
+  const cached = taskCache.get(cacheKey);
+  if (cached) {
+    console.log(`Returning ${cached.length} cached tasks`);
+    return cached;
+  }
+  
+  if (!window.roamAlphaAPI?.q) {
+    console.warn('Roam API not available, falling back to DOM parsing');
+    return getVisibleTasks();
+  }
+  
+  try {
+    console.log('Using simplified API queries...');
+    
+    // Simplified queries that avoid complex pulls
+    const todoQuery = `[:find ?b ?s :where [?b :block/string ?s] [(clojure.string/includes? ?s "{{[[TODO]]}}")]]`;
+    const doneQuery = `[:find ?b ?s :where [?b :block/string ?s] [(clojure.string/includes? ?s "{{[[DONE]]}}")]]`;
+    
+    console.log('Querying TODO blocks...');
+    const todoResults = await executeQuery(todoQuery);
+    console.log(`Found ${todoResults.length} TODO blocks via API`);
+    
+    // Skip DONE blocks processing - focus on active TODOs only
+    console.log('Skipping DONE blocks - focusing on active TODOs');
+    const doneResults = [];
+    
+    // Also try simple TODO pattern
+    const simpleTodoQuery = `[:find ?b ?s :where [?b :block/string ?s] [(clojure.string/includes? ?s "{{TODO}}")]]`;
+    console.log('Querying simple TODO pattern...');
+    const simpleTodoResults = await executeQuery(simpleTodoQuery);
+    console.log(`Found ${simpleTodoResults.length} simple TODO blocks via API`);
+    
+    // Focus on TODO blocks only - combine and deduplicate
+    const allResults = [...todoResults, ...simpleTodoResults];
+    const uniqueResults = new Map();
+    
+    console.log(`Processing ${allResults.length} TODO-focused results...`);
+    
+    allResults.forEach(([blockId, blockString]) => {
+      if (blockId && blockString && !uniqueResults.has(blockId)) {
+        // Basic validation - must contain TODO pattern
+        if (blockString.includes('{{[[TODO]]}}') || blockString.includes('{{TODO}}')) {
+          uniqueResults.set(blockId, blockString);
+        }
+      }
+    });
+    
+    console.log(`Total unique blocks after deduplication: ${uniqueResults.size}`);
+    
+    // Parse results into task objects
+    const tasks = [];
+    let processed = 0;
+    
+  for (const [blockId, blockString] of uniqueResults) {
+  try {
+    if (processed >= limit) break;
+    
+    // Parse the basic task data from string
+    const basicTask = parseTaskFromText(blockString);
+    if (!basicTask) continue;
+    
+    // Enhance with API-specific metadata
+    const task = {
+      ...basicTask,
+      id: blockId,
+      blockUID: blockId,
+      source: 'api',
+      rawText: blockString,
+      pageTitle: 'Unknown Page', // Default value
+      priorities: basicTask.priorities || { daily: 3, weekly: 5 },
+      metadata: basicTask.metadata || {}
+    };
+    
+    // Extract estimated duration from TODO patterns
+    const durationMatch = blockString.match(/(\d+)\s*(?:min|minutes|hrs|hours)/i);
+    if (durationMatch) {
+      const duration = parseInt(durationMatch[1]);
+      task.estimatedDuration = blockString.includes('hr') ? duration * 60 : duration;
+    }
+    
+    // Detect if this is a time block pattern
+    if (window.RoamFlow?.TimeBlockSystem?.isTimeBlock(blockString)) {
+      task.isTimeBlock = true;
+      try {
+        const timeBlockData = window.RoamFlow.TimeBlockSystem.parseTimeBlockFromText(blockString);
+        task.timeBlockData = timeBlockData;
+        task.context = timeBlockData.context;
+      } catch (e) {
+        console.warn('Time block parsing failed:', e.message);
+      }
+    }
+    
+    // Apply filters
+    if (filterTask(task, { contextFilter, pageFilter, caseFilter, timeRange })) {
+      tasks.push(task);
+      processed++;
+    }
+    
+  } catch (error) {
+    console.warn('Error parsing API block:', error, 'BlockString:', blockString);
+  }
+}
+
+    function parseTaskFromAPIBlock(blockId, blockString) {
+  try {
+    // Parse the basic task data from string
+    const task = parseTaskFromText(blockString);
+    if (!task) return null;
+    
+    // Enhance with API-specific metadata
+    task.id = blockId;
+    task.blockUID = blockId;
+    task.source = 'api';
+    task.rawText = blockString;
+    
+    // Try to get additional block metadata (non-blocking)
+    try {
+      const blockInfo = window.roamAlphaAPI.pull('[:block/uid :block/order]', blockId);
+      if (blockInfo) {
+        task.blockOrder = blockInfo[':block/order'] || 0;
+        task.blockUID = blockInfo[':block/uid'] || blockId;
+      }
+    } catch (e) {
+      // Metadata fetch failed - continue with basic task
+      task.blockOrder = 0;
+    }
+    
+    // Extract estimated duration from TODO patterns
+    const durationMatch = blockString.match(/(\d+)\s*(?:min|minutes|hrs|hours)/i);
+    if (durationMatch) {
+      const duration = parseInt(durationMatch[1]);
+      task.estimatedDuration = blockString.includes('hr') ? duration * 60 : duration;
+    }
+    
+    // Detect if this is a time block pattern
+    if (window.RoamFlow?.TimeBlockSystem?.isTimeBlock(blockString)) {
+      task.isTimeBlock = true;
+      try {
+        const timeBlockData = window.RoamFlow.TimeBlockSystem.parseTimeBlockFromText(blockString);
+        task.timeBlockData = timeBlockData;
+        task.context = timeBlockData.context;
+      } catch (e) {
+        console.warn('Time block parsing failed:', e.message);
+      }
+    }
+    
+    return task;
+  } catch (error) {
+    console.warn('Error parsing API task block:', error);
+    return null;
+  }
+}
+    
+    // Sort by creation order
+    tasks.sort((a, b) => (a.blockOrder || 0) - (b.blockOrder || 0));
+    
+    console.log(`Returning ${tasks.length} parsed tasks from API`);
+    
+    // Cache results
+    taskCache.set(cacheKey, tasks);
+    
+    return tasks;
+    
+  } catch (error) {
+    console.error('Error querying tasks from API:', error);
+    console.log('Falling back to DOM parsing');
+    return getVisibleTasks();
+  }
+}
+
+  /**
+   * Execute a Roam query with retry logic
+   * @param {string} query - Datalog query string
+   * @param {number} retries - Number of retries remaining
+   * @returns {Array} Query results
+   */
+  async function executeQuery(query, retries = CONFIG.MAX_QUERY_RETRIES) {
+  try {
+    // Simplified query execution with better error handling
+    console.log('Executing simplified query...');
+    const results = window.roamAlphaAPI.q(query);
+    
+    if (!results) {
+      console.warn('Query returned null/undefined');
+      return [];
+    }
+    
+    if (!Array.isArray(results)) {
+      console.warn('Query returned non-array result:', typeof results);
+      return [];
+    }
+    
+    console.log(`Query successful: ${results.length} results`);
+    return results;
+    
+  } catch (error) {
+    console.warn(`Query failed: ${error.message}`);
+    
+    if (retries > 0) {
+      console.log(`Retrying query (${retries} attempts left)...`);
+      await new Promise(resolve => setTimeout(resolve, 500)); // Shorter wait
+      return executeQuery(query, retries - 1);
+    } else {
+      throw error;
+    }
+  }
+}
+
+  /**
+   * Parse task object from API block result
+   * @param {Object} block - Block object from API
+   * @returns {Object} Parsed task object
+   */
+  async function parseTaskFromAPIBlock(block) {
+    const blockString = block[':block/string'] || '';
+    const blockUID = block[':block/uid'];
+    const blockOrder = block[':block/order'] || 0;
+    const children = block[':block/children'] || [];
+    
+    // Get page information
+    const pageEntity = block[':block/page'];
+    let pageTitle = null;
+    let pageUID = null;
+    
+    if (pageEntity && pageEntity[':db/id']) {
+      try {
+        const pageData = window.roamAlphaAPI.pull('[:node/title :block/uid]', pageEntity[':db/id']);
+        pageTitle = pageData[':node/title'] || null;
+        pageUID = pageData[':block/uid'] || null;
+      } catch (e) {
+        console.warn('Error getting page data:', e);
+      }
+    }
+    
+    // Parse the basic task data
+    const basicTask = parseTaskFromText(blockString);
+    if (!basicTask) {
+      return null;
+    }
+    
+    // Extract additional metadata from children
+    const metadata = extractMetadataFromChildren(children);
+    
+    // Combine all data
+    const task = {
+      ...basicTask,
+      id: blockUID,
+      blockUID: blockUID,
+      blockOrder: blockOrder,
+      pageTitle: pageTitle,
+      pageUID: pageUID,
+      source: 'api',
+      priorities: {
+        daily: metadata.dailyPriority,
+        weekly: metadata.weeklyPriority
+      },
+      metadata: {
+        ...metadata,
+        estimatedDuration: metadata.estimatedDuration || basicTask.timeBlockData?.estimatedDuration
+      }
+    };
+    
+    return task;
+  }
+
+  /**
+   * Extract metadata from child blocks
+   * @param {Array} children - Array of child blocks
+   * @returns {Object} Extracted metadata
+   */
+  function extractMetadataFromChildren(children) {
+    const metadata = {
+      dailyPriority: null,
+      weeklyPriority: null,
+      estimatedDuration: null,
+      actualDuration: null,
+      context: null,
+      minimumTime: null,
+      effectivenessRating: null
+    };
+    
+    children.forEach(child => {
+      const text = child[':block/string'] || '';
+      
+      if (text.startsWith('DailyPriority::')) {
+        const value = parseInt(text.split('::')[1]?.trim());
+        if (!isNaN(value)) metadata.dailyPriority = value;
+      }
+      
+      if (text.startsWith('WeeklyPriority::')) {
+        const value = parseInt(text.split('::')[1]?.trim());
+        if (!isNaN(value)) metadata.weeklyPriority = value;
+      }
+      
+      if (text.startsWith('EstimatedDuration::')) {
+        const value = parseInt(text.split('::')[1]?.trim());
+        if (!isNaN(value)) metadata.estimatedDuration = value;
+      }
+      
+      if (text.startsWith('ActualDuration::')) {
+        const value = parseInt(text.split('::')[1]?.trim());
+        if (!isNaN(value)) metadata.actualDuration = value;
+      }
+      
+      if (text.startsWith('Context::')) {
+        metadata.context = text.split('::')[1]?.trim();
+      }
+      
+      if (text.startsWith('MinimumTime::')) {
+        const value = parseInt(text.split('::')[1]?.trim());
+        if (!isNaN(value)) metadata.minimumTime = value;
+      }
+      
+      if (text.startsWith('EffectivenessRating::')) {
+        const value = parseInt(text.split('::')[1]?.trim());
+        if (!isNaN(value)) metadata.effectivenessRating = value;
+      }
+    });
+    
+    return metadata;
+  }
+
+  /**
+   * Filter task based on criteria
+   * @param {Object} task - Task to filter
+   * @param {Object} filters - Filter criteria
+   * @returns {boolean} Whether task passes filters
+   */
+
+  // Fix 3: Add a simple task validation function
+// This helps ensure we only process valid tasks
+
+function isValidTask(task) {
+  if (!task || typeof task !== 'object') return false;
+  if (!task.title && !task.rawText) return false;
+  if (task.title && task.title.trim().length === 0) return false;
+  return true;
+}
+  
+function filterTask(task, filters = {}) {
+  try {
+    if (!isValidTask(task)) return false;
+    
+    const { contextFilter, pageFilter, caseFilter, timeRange } = filters;
+    
+    // Context filter
+    if (contextFilter && task.context !== contextFilter) {
+      return false;
+    }
+    
+    // Page filter
+    if (pageFilter && task.pageTitle !== pageFilter) {
+      return false;
+    }
+    
+    // Case filter
+    if (caseFilter && (!task.caseReference || !task.caseReference.includes(caseFilter))) {
+      return false;
+    }
+    
+    // Time range filter (basic implementation)
+    if (timeRange && task.pageTitle) {
+      try {
+        // Try to parse page title as date
+        const taskDate = parseRoamDate(task.pageTitle);
+        if (taskDate && (taskDate < timeRange.start || taskDate > timeRange.end)) {
+          return false;
+        }
+      } catch (e) {
+        // If page title is not a date, include the task
+      }
+    }
+    
+    return true;
+  } catch (error) {
+    console.warn('Error in filterTask:', error);
+    return false; // Exclude tasks that cause filtering errors
+  }
+}
+
+  // =============================================================================
+  // TASK STATE MANAGEMENT
+  // =============================================================================
+
+  /**
+   * Mark a task as completed
+   * @param {string} blockUID - Block UID to mark complete
+   * @returns {boolean} Success status
+   */
+  async function markTaskComplete(blockUID) {
+    if (!blockUID) return false;
+    
+    try {
+      // First try API method
+      if (window.roamAlphaAPI?.updateBlock) {
+        const currentText = TimeBlockSystem.getBlockText(blockUID);
+        if (currentText) {
+          const updatedText = currentText.replace(/\{\{\[\[TODO\]\]\}\}/g, '{{[[DONE]]}}')
+                                        .replace(/\{\{TODO\}\}/g, '{{DONE}}');
+          
+          if (updatedText !== currentText) {
+            const success = TimeBlockSystem.updateBlockText(blockUID, updatedText);
+            if (success) {
+              // Clear cache to force refresh
+              taskCache.clear();
+              
+              // Log completion for ML data collection
+              if (Foundation?.logTaskCompletion) {
+                const task = await getTaskByUID(blockUID);
+                if (task) {
+                  Foundation.logTaskCompletion(task, task.metadata?.estimatedDuration);
+                }
+              }
+              
+              return true;
+            }
+          }
+        }
+      }
+      
+      // Fallback to DOM manipulation
+      return TimeBlockSystem.markTimeBlockComplete(blockUID);
+      
+    } catch (error) {
+      console.error('Error marking task complete:', error);
+      return false;
+    }
+  }
+
+  /**
+   * Mark a task as incomplete (reopen)
+   * @param {string} blockUID - Block UID to mark incomplete
+   * @returns {boolean} Success status
+   */
+  async function markTaskIncomplete(blockUID) {
+    if (!blockUID) return false;
+    
+    try {
+      const currentText = TimeBlockSystem.getBlockText(blockUID);
+      if (currentText) {
+        const updatedText = currentText.replace(/\{\{\[\[DONE\]\]\}\}/g, '{{[[TODO]]}}')
+                                      .replace(/\{\{DONE\}\}/g, '{{TODO}}');
+        
+        if (updatedText !== currentText) {
+          const success = TimeBlockSystem.updateBlockText(blockUID, updatedText);
+          if (success) {
+            // Clear cache to force refresh
+            taskCache.clear();
+            return true;
+          }
+        }
+      }
+      
+      return false;
+    } catch (error) {
+      console.error('Error marking task incomplete:', error);
+      return false;
+    }
+  }
+
+  /**
+   * Get task by block UID
+   * @param {string} blockUID - Block UID to retrieve
+   * @returns {Object|null} Task object or null
+   */
+  async function getTaskByUID(blockUID) {
+    if (!blockUID) return null;
+    
+    try {
+      // First check if it's a time block
+      const timeBlock = TimeBlockSystem.parseTimeBlock(blockUID);
+      if (timeBlock) {
+        return {
+          ...timeBlock,
+          id: blockUID,
+          blockUID: blockUID,
+          source: 'timeblock'
+        };
+      }
+      
+      // Otherwise try to parse as regular task
+      const blockText = TimeBlockSystem.getBlockText(blockUID);
+      if (blockText) {
+        const task = parseTaskFromText(blockText);
+        if (task) {
+          task.id = blockUID;
+          task.blockUID = blockUID;
+          task.source = 'direct';
+          return task;
+        }
+      }
+      
+      return null;
+    } catch (error) {
+      console.error('Error getting task by UID:', error);
+      return null;
+    }
+  }
+
+  // =============================================================================
+  // HIGH-LEVEL TASK OPERATIONS
+  // =============================================================================
+
+  /**
+   * Get all tasks with filtering and sorting options
+   * @param {Object} options - Query options
+   * @returns {Array} Array of task objects
+   */
+  async function getAllTasks(options = {}) {
+     const {
+      method = 'hybrid', // 'dom', 'api', or 'hybrid'
+      includeCompleted = true,
+      sortBy = 'priority', // 'priority', 'deadline', 'context', 'page'
+      limit = CONFIG.INITIAL_TASK_LIMIT,
+      todoOnly = false, // NEW: Skip DONE tasks entirely for performance
+      ...filterOptions
+    } = options;
+    
+    let tasks = [];
+    
+    try {
+      switch (method) {
+        case 'dom':
+          tasks = getVisibleTasks();
+          break;
+          
+        case 'api':
+          tasks = await queryTasksFromAPI({ 
+            ...filterOptions, 
+            limit,
+            completedOnly: includeCompleted ? null : false 
+          });
+          break;
+          
+case 'hybrid':
+default:
+  // Get visible tasks first for immediate response
+  const visibleTasks = getVisibleTasks();
+  console.log('Visible tasks found:', visibleTasks.length);
+  
+  // Then get API tasks if available
+  if (window.roamAlphaAPI?.q) {
+    const apiTasks = await queryTasksFromAPI({ 
+      ...filterOptions, 
+      limit,
+      completedOnly: todoOnly ? false : (includeCompleted ? null : false)
+    });
+    
+    console.log('API tasks found:', apiTasks.length);
+    
+    // Filter out null/invalid tasks
+    const validApiTasks = apiTasks.filter(task => {
+      const isValid = task && 
+                     typeof task === 'object' && 
+                     (task.title || task.rawText) &&
+                     task.title !== null &&
+                     task.title !== undefined;
+      
+      if (!isValid) {
+        console.warn('Invalid API task filtered out:', task);
+      }
+      
+      return isValid;
+    });
+    
+    console.log('Valid API tasks after filtering:', validApiTasks.length);
+    
+    // Merge and deduplicate
+    const taskMap = new Map();
+    
+    // Add API tasks first (more complete data)
+    validApiTasks.forEach(task => {
+      if (task.blockUID || task.id) {
+        const key = task.blockUID || task.id;
+        taskMap.set(key, task);
+      }
+    });
+    
+    // Add visible tasks that aren't already included
+    visibleTasks.forEach(task => {
+      const key = task.blockUID || task.id;
+      if (key && !taskMap.has(key)) {
+        taskMap.set(key, task);
+      }
+    });
+    
+    tasks = Array.from(taskMap.values());
+    console.log('Final merged tasks:', tasks.length);
+  } else {
+    tasks = visibleTasks;
+  }
+  break;
+      }
+      
+      // Filter completed tasks if requested
+      if (!includeCompleted) {
+        tasks = tasks.filter(task => !task.completed);
+      }
+      
+      // Sort tasks
+      tasks = sortTasks(tasks, sortBy);
+      
+      console.log(`Returning ${tasks.length} tasks (method: ${method})`);
+      return tasks;
+      
+    } catch (error) {
+      console.error('Error getting all tasks:', error);
+      return [];
+    }
+  }
+
+  /**
+   * Sort tasks by specified criteria
+   * @param {Array} tasks - Tasks to sort
+   * @param {string} sortBy - Sort criteria
+   * @returns {Array} Sorted tasks
+   */
+  function sortTasks(tasks, sortBy) {
+    switch (sortBy) {
+      case 'priority':
+        return tasks.sort((a, b) => {
+          // Use Foundation priority calculation if available
+          if (Foundation?.calculateTaskScore) {
+            const scoreA = Foundation.calculateTaskScore(a).score;
+            const scoreB = Foundation.calculateTaskScore(b).score;
+            return scoreB - scoreA;
+          }
+          
+          // Fallback to simple priority comparison
+          const priorityA = a.priorities?.daily || a.priority || 3;
+          const priorityB = b.priorities?.daily || b.priority || 3;
+          return priorityB - priorityA;
+        });
+        
+      case 'deadline':
+        return tasks.sort((a, b) => {
+          const deadlineA = a.deadline ? new Date(a.deadline) : new Date('2099-12-31');
+          const deadlineB = b.deadline ? new Date(b.deadline) : new Date('2099-12-31');
+          return deadlineA.getTime() - deadlineB.getTime();
+        });
+        
+      case 'context':
+        return tasks.sort((a, b) => {
+          return (a.context || '').localeCompare(b.context || '');
+        });
+        
+      case 'page':
+        return tasks.sort((a, b) => {
+          const pageCompare = (a.pageTitle || '').localeCompare(b.pageTitle || '');
+          if (pageCompare !== 0) return pageCompare;
+          return (a.blockOrder || 0) - (b.blockOrder || 0);
+        });
+        
+      default:
+        return tasks;
+    }
+  }
+
+  /**
+   * Get tasks for a specific legal case
+   * @param {string} caseReference - Case reference to filter by
+   * @param {Object} options - Additional options
+   * @returns {Array} Array of tasks for the case
+   */
+  async function getTasksForCase(caseReference, options = {}) {
+    const { includeCompleted = true, sortBy = 'priority' } = options;
+    
+    const allTasks = await getAllTasks({
+      caseFilter: caseReference,
+      includeCompleted,
+      sortBy,
+      ...options
+    });
+    
+    return allTasks.filter(task => 
+      task.caseReference && task.caseReference.includes(caseReference)
+    );
+  }
+
+  /**
+   * Get tasks by context (legal practice area)
+   * @param {string} context - Legal context to filter by
+   * @param {Object} options - Additional options
+   * @returns {Array} Array of tasks for the context
+   */
+  async function getTasksByContext(context, options = {}) {
+    const { includeCompleted = true, sortBy = 'priority' } = options;
+    
+    return getAllTasks({
+      contextFilter: context,
+      includeCompleted,
+      sortBy,
+      ...options
+    });
+  }
+
+  // =============================================================================
+  // CHANGE DETECTION AND REAL-TIME UPDATES
+  // =============================================================================
+
+  let domObserver = null;
+  let observerCallbacks = [];
+
+  /**
+   * Start observing DOM changes for task updates
+   * @param {Function} callback - Function to call when tasks change
+   */
+  function startTaskChangeObserver(callback) {
+    if (callback && typeof callback === 'function') {
+      observerCallbacks.push(callback);
+    }
+    
+    if (domObserver) {
+      return; // Already observing
+    }
+    
+    // Create debounced handler
+    let debounceTimer = null;
+    const debouncedHandler = () => {
+      if (debounceTimer) clearTimeout(debounceTimer);
+      debounceTimer = setTimeout(() => {
+        taskCache.clear(); // Clear cache when DOM changes
+        observerCallbacks.forEach(cb => {
+          try {
+            cb();
+          } catch (error) {
+            console.error('Error in task change callback:', error);
+          }
+        });
+      }, CONFIG.DOM_PARSE_DEBOUNCE);
+    };
+    
+    // Set up DOM observer
+    domObserver = new MutationObserver((mutations) => {
+      let hasTaskChanges = false;
+      
+      mutations.forEach(mutation => {
+        if (mutation.type === 'childList' || mutation.type === 'characterData') {
+          // Check if changes involve task-related elements
+          const target = mutation.target;
+          if (target.textContent && 
+              (target.textContent.includes('{{[[TODO]]}}') || 
+               target.textContent.includes('{{[[DONE]]}}') ||
+               target.textContent.includes('{{TODO}}') ||
+               target.textContent.includes('{{DONE}}'))) {
+            hasTaskChanges = true;
+          }
+        }
+      });
+      
+      if (hasTaskChanges) {
+        debouncedHandler();
+      }
+    });
+    
+    // Start observing
+    domObserver.observe(document.body, {
+      childList: true,
+      subtree: true,
+      characterData: true
+    });
+    
+    console.log('Task change observer started');
+  }
+
+  /**
+   * Stop observing DOM changes
+   */
+  function stopTaskChangeObserver() {
+    if (domObserver) {
+      domObserver.disconnect();
+      domObserver = null;
+      observerCallbacks = [];
+      console.log('Task change observer stopped');
+    }
+  }
+
+  // =============================================================================
+  // DIAGNOSTICS AND UTILITIES
+  // =============================================================================
+
+  /**
+   * Run diagnostics on task detection system
+   * @returns {Object} Diagnostic results
+   */
+  function runDiagnostics() {
+    const diagnostics = {
+      timestamp: new Date().toISOString(),
+      roamApiAvailable: !!window.roamAlphaAPI?.q,
+      modulesDependencies: {
+        foundation: !!window.RoamFlow?.Foundation,
+        timeBlockSystem: !!window.RoamFlow?.TimeBlockSystem
+      },
+      cacheStatus: {
+        size: taskCache.cache.size,
+        oldestEntry: null
+      },
+      domElements: {
+        blockTextElements: document.querySelectorAll('.rm-block-text').length,
+        roamBlocks: document.querySelectorAll('.roam-block').length
+      },
+      visibleTasks: 0,
+      errors: []
+    };
+    
+    // Check cache age
+    if (taskCache.timestamps.size > 0) {
+      const timestamps = Array.from(taskCache.timestamps.values());
+      const oldestTimestamp = Math.min(...timestamps);
+      diagnostics.cacheStatus.oldestEntry = Date.now() - oldestTimestamp;
+    }
+    
+    // Test visible task parsing
+    try {
+      const visibleTasks = getVisibleTasks();
+      diagnostics.visibleTasks = visibleTasks.length;
+    } catch (error) {
+      diagnostics.errors.push(`Visible task parsing error: ${error.message}`);
+    }
+    
+    // Test API if available
+    if (diagnostics.roamApiAvailable) {
+      try {
+        const testQuery = '[:find ?e :where [?e :node/title "Today"] :limit 1]';
+        window.roamAlphaAPI.q(testQuery);
+        diagnostics.apiTest = 'passed';
+      } catch (error) {
+        diagnostics.errors.push(`API test error: ${error.message}`);
+        diagnostics.apiTest = 'failed';
+      }
+    }
+    
+    console.log('Task Detection Diagnostics:', diagnostics);
+    return diagnostics;
+  }
+
+  /**
+   * Clear all caches and reset state
+   */
+  function resetTaskDetection() {
+    taskCache.clear();
+    stopTaskChangeObserver();
+    console.log('Task detection system reset');
+  }
+
+  // =============================================================================
+  // MODULE PUBLIC INTERFACE
+  // =============================================================================
+
+  /**
+   * Module 3 Public Interface
+   * Task detection and state management for RoamFlow
+   */
+  const TaskDetection = {
+    // Primary task retrieval methods
+    getAllTasks,
+    getVisibleTasks,
+    queryTasksFromAPI,
+    getTaskByUID,
+    getTasksForCase,
+    getTasksByContext,
+    
+    // Task state management
+    markTaskComplete,
+    markTaskIncomplete,
+    
+    // Parsing and detection
+    parseTaskFromText,
+    detectContextFromText,
+    isTaskText: (text) => {
+      return TASK_PATTERNS.TODO.test(text) || 
+             TASK_PATTERNS.DONE.test(text) ||
+             TASK_PATTERNS.SMARTBLOCK_TODO.test(text) ||
+             TASK_PATTERNS.SMARTBLOCK_DONE.test(text);
+    },
+    
+    // Change monitoring
+    startTaskChangeObserver,
+    stopTaskChangeObserver,
+    
+    // Utilities
+    sortTasks,
+    getDefaultTimeRange,
+    getWeekRange,
+    formatDateForRoam,
+    
+    // Cache management
+    clearCache: () => taskCache.clear(),
+    getCacheStatus: () => ({
+      size: taskCache.cache.size,
+      ages: Array.from(taskCache.timestamps.entries()).map(([key, timestamp]) => ({
+        key,
+        age: Date.now() - timestamp
+      }))
+    }),
+    
+    // Diagnostics
+    runDiagnostics,
+    resetTaskDetection,
+    
+    // Configuration
+    CONFIG,
+    TASK_PATTERNS,
+    LEGAL_CONTEXT_PATTERNS
+  };
+
+  // Export to global scope
+  if (typeof window !== 'undefined') {
+    window.RoamFlow = window.RoamFlow || {};
+    window.RoamFlow.TaskDetection = TaskDetection;
+  }
+
+  console.log('RoamFlow Module 3: Task Detection & State loaded successfully');
+  console.log('Task detection methods: DOM + API hybrid approach');
+  console.log('Legal context patterns configured');
+  console.log('Cache system initialized');
+
+  return TaskDetection;
+
+})();
