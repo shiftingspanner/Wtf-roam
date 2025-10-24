@@ -1,0 +1,22 @@
+{
+  "name": "wtf-roam",
+  "version": "1.0.0",
+  "description": "Workflow optimization for Roam Research - What To Focus on",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "devDependencies": {
+    "vite": "^5.0.0"
+  },
+  "keywords": [
+    "roam-research",
+    "productivity",
+    "task-management",
+    "workflow"
+  ],
+  "author": "",
+  "license": "MIT"
+}
