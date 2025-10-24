@@ -1,0 +1,966 @@
+/**
+ * Module 2: Time Block System
+ * 
+ * Core time block functionality for RoamFlow legal practice workflow optimization.
+ * Manages time blocks as fundamental units stored in Roam's daily notes structure.
+ * 
+ * Block Structure:
+ * - Parent: {{[[TODO]]}} 09:00-10:30 **Evidence** [[Case/24-001234]] - Task description
+ * - Children: DailyPriority:: 5, WeeklyPriority:: 8, Context:: evidence, etc.
+ */
+
+(() => {
+  'use strict';
+
+  // =============================================================================
+  // CONSTANTS AND CONFIGURATION
+  // =============================================================================
+
+  const LEGAL_CONTEXTS = {
+    'supervision': 'Managing junior staff, reviewing their work, guidance and mentoring',
+    'logistics': 'Scheduling, file management, administrative coordination, system maintenance',
+    'practice-management': 'Business development, marketing, financial planning, strategic decisions',
+    'client-contact': 'Client meetings, calls, emails, consultations, relationship management',
+    'drafting': 'Document creation, contract drafting, brief writing, correspondence',
+    'evidence': 'Discovery, evidence review, document analysis, preparation of exhibits',
+    'finalising': 'Final review, proofreading, filing, completion tasks, matter closure'
+  };
+
+  const DEFAULT_MINIMUM_TIMES = {
+    'supervision': 30,
+    'logistics': 15,
+    'practice-management': 45,
+    'client-contact': 30,
+    'drafting': 30,
+    'evidence': 45,
+    'finalising': 15
+  };
+
+  const TIME_BLOCK_PATTERN = /\{\{(?:\[\[TODO\]\]|\[\[DONE\]\])\}\}\s*(\d{2}:\d{2})-(\d{2}:\d{2})\s*\*\*(\w+)\*\*(.*)/;
+  const CASE_REFERENCE_PATTERN = /\[\[Case\/[\w-]+\]\]/;
+
+  // =============================================================================
+  // CORE TIME UTILITIES (Pure Functions)
+  // =============================================================================
+
+  /**
+   * Parse time string to minutes since midnight
+   * @param {string} timeString - Format "HH:MM"
+   * @returns {number} Minutes since midnight
+   */
+  function parseTimeString(timeString) {
+    if (!timeString || typeof timeString !== 'string') {
+      throw new Error('Invalid time string');
+    }
+    
+    const [hours, minutes] = timeString.split(':').map(Number);
+    
+    if (isNaN(hours) || isNaN(minutes) || hours < 0 || hours > 23 || minutes < 0 || minutes > 59) {
+      throw new Error(`Invalid time format: ${timeString}. Use HH:MM format.`);
+    }
+    
+    return hours * 60 + minutes;
+  }
+
+  /**
+   * Format minutes since midnight to time string
+   * @param {number} minutes - Minutes since midnight
+   * @returns {string} Time in "HH:MM" format
+   */
+  function formatTimeFromMinutes(minutes) {
+    if (typeof minutes !== 'number' || minutes < 0) {
+      throw new Error('Invalid minutes value');
+    }
+    
+    const hours = Math.floor(minutes / 60) % 24;
+    const mins = minutes % 60;
+    
+    return `${hours.toString().padStart(2, '0')}:${mins.toString().padStart(2, '0')}`;
+  }
+
+  /**
+   * Calculate duration between two times
+   * @param {string} startTime - Format "HH:MM"
+   * @param {string} endTime - Format "HH:MM" 
+   * @returns {number} Duration in minutes
+   */
+  function calculateDuration(startTime, endTime) {
+    const startMinutes = parseTimeString(startTime);
+    const endMinutes = parseTimeString(endTime);
+    
+    if (endMinutes <= startMinutes) {
+      throw new Error('End time must be after start time');
+    }
+    
+    return endMinutes - startMinutes;
+  }
+
+  /**
+   * Calculate time remaining in a block
+   * @param {Object} timeBlock - Time block object with timeRange
+   * @returns {number} Minutes remaining (can be negative if overdue)
+   */
+  function getCurrentTimeRemaining(timeBlock) {
+    if (!timeBlock || !timeBlock.timeRange) {
+      return 0;
+    }
+    
+    const now = new Date();
+    const currentTimeMinutes = now.getHours() * 60 + now.getMinutes();
+    const endTimeMinutes = parseTimeString(timeBlock.timeRange.end);
+    
+    return endTimeMinutes - currentTimeMinutes;
+  }
+
+  /**
+   * Check if two time blocks overlap
+   * @param {Object} block1 - First time block
+   * @param {Object} block2 - Second time block  
+   * @returns {boolean} True if blocks overlap
+   */
+  function timeBlocksOverlap(block1, block2) {
+    if (!block1?.timeRange || !block2?.timeRange) {
+      return false;
+    }
+    
+    const start1 = parseTimeString(block1.timeRange.start);
+    const end1 = parseTimeString(block1.timeRange.end);
+    const start2 = parseTimeString(block2.timeRange.start);
+    const end2 = parseTimeString(block2.timeRange.end);
+    
+    // No overlap if one ends when the other starts (back-to-back is OK)
+    return start1 < end2 && start2 < end1;
+  }
+
+  // =============================================================================
+  // BLOCK PARSING AND VALIDATION
+  // =============================================================================
+
+  /**
+   * Check if a block text represents a time block
+   * @param {string} blockText - The block text to check
+   * @returns {boolean} True if it's a time block
+   */
+  function isTimeBlock(blockText) {
+    if (!blockText || typeof blockText !== 'string') {
+      return false;
+    }
+    
+    return TIME_BLOCK_PATTERN.test(blockText.trim());
+  }
+
+  /**
+   * Parse a time block from text
+   * @param {string} blockText - The block text to parse
+   * @returns {Object} Parsed time block data
+   */
+  function parseTimeBlockFromText(blockText) {
+    if (!blockText || typeof blockText !== 'string') {
+      throw new Error('Invalid block text');
+    }
+    
+    const match = blockText.trim().match(TIME_BLOCK_PATTERN);
+    if (!match) {
+      throw new Error('Text does not match time block pattern');
+    }
+    
+    const [, startTime, endTime, context, remainder] = match;
+    
+    // Validate context
+    if (!LEGAL_CONTEXTS[context.toLowerCase()]) {
+      throw new Error(`Invalid context: ${context}. Must be one of: ${Object.keys(LEGAL_CONTEXTS).join(', ')}`);
+    }
+    
+    // Extract case reference and task description
+    const caseMatch = remainder.match(CASE_REFERENCE_PATTERN);
+    const caseReference = caseMatch ? caseMatch[0] : null;
+    
+    let taskDescription = remainder.trim();
+    if (caseReference) {
+      taskDescription = taskDescription.replace(caseReference, '').trim();
+      if (taskDescription.startsWith('-')) {
+        taskDescription = taskDescription.substring(1).trim();
+      }
+    }
+    
+    // Determine if completed
+    const isCompleted = blockText.includes('{{[[DONE]]}}');
+    
+    try {
+      const duration = calculateDuration(startTime, endTime);
+      
+      return {
+        timeRange: { start: startTime, end: endTime },
+        context: context.toLowerCase(),
+        caseReference,
+        taskDescription,
+        isCompleted,
+        estimatedDuration: duration
+      };
+    } catch (error) {
+      throw new Error(`Invalid time range: ${error.message}`);
+    }
+  }
+
+  /**
+   * Validate priority values
+   * @param {number} dailyPriority - Daily priority (1-5)
+   * @param {number} weeklyPriority - Weekly priority (1-10)
+   * @returns {Object} Validation result
+   */
+  function validatePriorities(dailyPriority, weeklyPriority) {
+    const errors = [];
+    
+    if (!Number.isInteger(dailyPriority) || dailyPriority < 1 || dailyPriority > 5) {
+      errors.push('Daily priority must be an integer between 1 and 5');
+    }
+    
+    if (!Number.isInteger(weeklyPriority) || weeklyPriority < 1 || weeklyPriority > 10) {
+      errors.push('Weekly priority must be an integer between 1 and 10');
+    }
+    
+    return {
+      isValid: errors.length === 0,
+      errors
+    };
+  }
+
+  /**
+   * Validate time block data before creation
+   * @param {Object} timeBlockData - Time block data to validate
+   * @returns {Object} Validation result
+   */
+  function validateTimeBlockData(timeBlockData) {
+    const errors = [];
+    const warnings = [];
+    
+    // Required fields
+    if (!timeBlockData.startTime) errors.push('Start time is required');
+    if (!timeBlockData.endTime) errors.push('End time is required');
+    if (!timeBlockData.context) errors.push('Context is required');
+    
+    // Time format validation
+    try {
+      if (timeBlockData.startTime) parseTimeString(timeBlockData.startTime);
+    } catch (e) {
+      errors.push(`Invalid start time: ${e.message}`);
+    }
+    
+    try {
+      if (timeBlockData.endTime) parseTimeString(timeBlockData.endTime);
+    } catch (e) {
+      errors.push(`Invalid end time: ${e.message}`);
+    }
+    
+    // Duration validation
+    if (timeBlockData.startTime && timeBlockData.endTime) {
+      try {
+        const duration = calculateDuration(timeBlockData.startTime, timeBlockData.endTime);
+        
+        if (duration < 15) {
+          warnings.push('Block duration is less than 15 minutes - consider merging with adjacent blocks');
+        }
+        
+        if (duration > 240) { // 4 hours
+          warnings.push('Block duration exceeds 4 hours - consider adding breaks');
+        }
+      } catch (e) {
+        errors.push(e.message);
+      }
+    }
+    
+    // Context validation
+    if (timeBlockData.context && !LEGAL_CONTEXTS[timeBlockData.context]) {
+      errors.push(`Invalid context: ${timeBlockData.context}. Must be one of: ${Object.keys(LEGAL_CONTEXTS).join(', ')}`);
+    }
+    
+    // Priority validation
+    if (timeBlockData.dailyPriority !== undefined || timeBlockData.weeklyPriority !== undefined) {
+      const priorityValidation = validatePriorities(
+        timeBlockData.dailyPriority || 3,
+        timeBlockData.weeklyPriority || 5
+      );
+      errors.push(...priorityValidation.errors);
+    }
+    
+    return {
+      isValid: errors.length === 0,
+      errors,
+      warnings
+    };
+  }
+
+  // =============================================================================
+  // ROAM API INTEGRATION
+  // =============================================================================
+
+  /**
+   * Get text content of a block by UID
+   * @param {string} blockUID - The block UID
+   * @returns {string|null} Block text or null if not found
+   */
+  function getBlockText(blockUID) {
+    if (!blockUID) return null;
+    
+    try {
+      if (window.roamAlphaAPI && window.roamAlphaAPI.q) {
+        const query = `[:find (pull ?b [:block/string]) :where [?b :block/uid "${blockUID}"]]`;
+        const results = window.roamAlphaAPI.q(query);
+        
+        if (results && results.length > 0 && results[0].length > 0) {
+          return results[0][0][':block/string'] || null;
+        }
+      }
+      
+      // DOM fallback
+      const blockEl = document.querySelector(`[id$="${blockUID}"]`);
+      if (blockEl) {
+        const textEl = blockEl.querySelector('.rm-block-text');
+        return textEl ? textEl.innerText : null;
+      }
+      
+      return null;
+    } catch (error) {
+      console.error('Error getting block text:', error);
+      return null;
+    }
+  }
+
+  /**
+   * Update block text content
+   * @param {string} blockUID - The block UID
+   * @param {string} text - New text content
+   * @returns {boolean} Success status
+   */
+  function updateBlockText(blockUID, text) {
+    if (!blockUID || text === undefined) return false;
+    
+    try {
+      if (window.roamAlphaAPI && window.roamAlphaAPI.updateBlock) {
+        window.roamAlphaAPI.updateBlock({
+          block: { uid: blockUID, string: text }
+        });
+        return true;
+      }
+      
+      // DOM fallback
+      const blockEl = document.querySelector(`[id$="${blockUID}"]`);
+      if (blockEl) {
+        const textEl = blockEl.querySelector('.rm-block-text');
+        if (textEl) {
+          textEl.focus();
+          const selection = window.getSelection();
+          const range = document.createRange();
+          range.selectNodeContents(textEl);
+          selection.removeAllRanges();
+          selection.addRange(range);
+          document.execCommand('insertText', false, text);
+          return true;
+        }
+      }
+      
+      return false;
+    } catch (error) {
+      console.error('Error updating block text:', error);
+      return false;
+    }
+  }
+
+  /**
+   * Create a child block under a parent
+   * @param {string} parentUID - Parent block UID
+   * @param {string} text - Child block text
+   * @param {number} order - Order/position of child block
+   * @returns {string|null} New block UID or null if failed
+   */
+  function createChildBlock(parentUID, text, order = 0) {
+    if (!parentUID || !text) return null;
+    
+    try {
+      const newBlockUID = generateUID();
+      
+      if (window.roamAlphaAPI && window.roamAlphaAPI.createBlock) {
+        window.roamAlphaAPI.createBlock({
+          location: { "parent-uid": parentUID, order: order },
+          block: { string: text, uid: newBlockUID }
+        });
+        return newBlockUID;
+      }
+      
+      return null;
+    } catch (error) {
+      console.error('Error creating child block:', error);
+      return null;
+    }
+  }
+
+  /**
+   * Generate a unique ID similar to Roam's format
+   * @returns {string} Unique ID
+   */
+  function generateUID() {
+    const generatePart = () => {
+      return Math.floor((1 + Math.random()) * 0x10000)
+        .toString(16)
+        .substring(1);
+    };
+    
+    return generatePart() + generatePart() + generatePart();
+  }
+
+  /**
+   * Get children of a block with their text content
+   * @param {string} blockUID - Parent block UID
+   * @returns {Array} Array of child block objects
+   */
+  function getBlockChildren(blockUID) {
+    if (!blockUID) return [];
+    
+    try {
+      if (window.roamAlphaAPI && window.roamAlphaAPI.q) {
+        const query = `[:find (pull ?c [:block/uid :block/string :block/order])
+                        :where 
+                        [?p :block/uid "${blockUID}"]
+                        [?p :block/children ?c]]`;
+        const results = window.roamAlphaAPI.q(query);
+        
+        return results.map(([block]) => ({
+          uid: block[':block/uid'],
+          text: block[':block/string'] || '',
+          order: block[':block/order'] || 0
+        })).sort((a, b) => a.order - b.order);
+      }
+      
+      return [];
+    } catch (error) {
+      console.error('Error getting block children:', error);
+      return [];
+    }
+  }
+
+  // =============================================================================
+  // TIME BLOCK METADATA EXTRACTION
+  // =============================================================================
+
+  /**
+   * Extract metadata from time block children
+   * @param {string} blockUID - Time block UID
+   * @returns {Object} Metadata object
+   */
+  function extractBlockMetadata(blockUID) {
+    const children = getBlockChildren(blockUID);
+    const metadata = {
+      dailyPriority: null,
+      weeklyPriority: null,
+      context: null,
+      minimumTime: null,
+      estimatedDuration: null,
+      actualDuration: null,
+      effectivenessRating: null
+    };
+    
+    children.forEach(child => {
+      const text = child.text.trim();
+      
+      if (text.startsWith('DailyPriority::')) {
+        const value = parseInt(text.split('::')[1]?.trim());
+        if (!isNaN(value)) metadata.dailyPriority = value;
+      }
+      
+      if (text.startsWith('WeeklyPriority::')) {
+        const value = parseInt(text.split('::')[1]?.trim());
+        if (!isNaN(value)) metadata.weeklyPriority = value;
+      }
+      
+      if (text.startsWith('Context::')) {
+        metadata.context = text.split('::')[1]?.trim();
+      }
+      
+      if (text.startsWith('MinimumTime::')) {
+        const value = parseInt(text.split('::')[1]?.trim());
+        if (!isNaN(value)) metadata.minimumTime = value;
+      }
+      
+      if (text.startsWith('EstimatedDuration::')) {
+        const value = parseInt(text.split('::')[1]?.trim());
+        if (!isNaN(value)) metadata.estimatedDuration = value;
+      }
+      
+      if (text.startsWith('ActualDuration::')) {
+        const value = parseInt(text.split('::')[1]?.trim());
+        if (!isNaN(value)) metadata.actualDuration = value;
+      }
+      
+      if (text.startsWith('EffectivenessRating::')) {
+        const value = parseInt(text.split('::')[1]?.trim());
+        if (!isNaN(value)) metadata.effectivenessRating = value;
+      }
+    });
+    
+    return metadata;
+  }
+
+  /**
+   * Parse complete time block data from block UID
+   * @param {string} blockUID - Block UID to parse
+   * @returns {Object|null} Complete time block object or null
+   */
+  function parseTimeBlock(blockUID) {
+    if (!blockUID) return null;
+    
+    try {
+      const blockText = getBlockText(blockUID);
+      if (!blockText || !isTimeBlock(blockText)) {
+        return null;
+      }
+      
+      const basicData = parseTimeBlockFromText(blockText);
+      const metadata = extractBlockMetadata(blockUID);
+      
+      return {
+        blockUID,
+        ...basicData,
+        priorities: {
+          daily: metadata.dailyPriority,
+          weekly: metadata.weeklyPriority
+        },
+        metadata: {
+          context: metadata.context || basicData.context,
+          minimumTime: metadata.minimumTime,
+          estimatedDuration: metadata.estimatedDuration || basicData.estimatedDuration,
+          actualDuration: metadata.actualDuration,
+          effectivenessRating: metadata.effectivenessRating
+        },
+        timeRemaining: basicData.isCompleted ? 0 : getCurrentTimeRemaining(basicData)
+      };
+    } catch (error) {
+      console.error('Error parsing time block:', error);
+      return null;
+    }
+  }
+
+  // =============================================================================
+  // TIME BLOCK CREATION AND MANAGEMENT
+  // =============================================================================
+
+  /**
+   * Create a new time block in Roam
+   * @param {Object} timeBlockData - Time block configuration
+   * @returns {string|null} Block UID of created time block or null if failed
+   */
+  function createTimeBlock(timeBlockData) {
+    // Validate input data
+    const validation = validateTimeBlockData(timeBlockData);
+    if (!validation.isValid) {
+      throw new Error(`Validation failed: ${validation.errors.join(', ')}`);
+    }
+    
+    // Show warnings if any
+    if (validation.warnings.length > 0) {
+      console.warn('Time block warnings:', validation.warnings);
+    }
+    
+    // Check for conflicts with existing blocks
+    const conflicts = findTimeConflicts(timeBlockData);
+    if (conflicts.length > 0) {
+      throw new Error(`Time block conflicts with existing blocks: ${conflicts.map(c => c.timeRange.start + '-' + c.timeRange.end).join(', ')}`);
+    }
+    
+    try {
+      // Create parent block text
+      const contextDisplay = timeBlockData.context.charAt(0).toUpperCase() + timeBlockData.context.slice(1);
+      let parentText = `{{[[TODO]]}} ${timeBlockData.startTime}-${timeBlockData.endTime} **${contextDisplay}**`;
+      
+      if (timeBlockData.caseReference) {
+        parentText += ` ${timeBlockData.caseReference}`;
+      }
+      
+      if (timeBlockData.taskDescription) {
+        const separator = timeBlockData.caseReference ? ' - ' : ' ';
+        parentText += separator + timeBlockData.taskDescription;
+      }
+      
+      // Create parent block on today's daily note
+      const todayPageTitle = getTodayPageTitle();
+      const pageUID = getOrCreateDailyNotePage(todayPageTitle);
+      
+      if (!pageUID) {
+        throw new Error('Failed to get or create daily note page');
+      }
+      
+      const parentUID = createChildBlock(pageUID, parentText);
+      if (!parentUID) {
+        throw new Error('Failed to create parent time block');
+      }
+      
+      // Create metadata child blocks
+      const childOrder = 0;
+      const dailyPriority = timeBlockData.dailyPriority || 3;
+      const weeklyPriority = timeBlockData.weeklyPriority || 5;
+      const minimumTime = timeBlockData.minimumTime || DEFAULT_MINIMUM_TIMES[timeBlockData.context] || 30;
+      const estimatedDuration = timeBlockData.estimatedDuration || calculateDuration(timeBlockData.startTime, timeBlockData.endTime);
+      
+      const childBlocks = [
+        `DailyPriority:: ${dailyPriority}`,
+        `WeeklyPriority:: ${weeklyPriority}`,
+        `Context:: ${timeBlockData.context}`,
+        `MinimumTime:: ${minimumTime}`,
+        `EstimatedDuration:: ${estimatedDuration}`
+      ];
+      
+      childBlocks.forEach((text, index) => {
+        createChildBlock(parentUID, text, index);
+      });
+      
+      console.log('Time block created successfully:', parentUID);
+      return parentUID;
+      
+    } catch (error) {
+      console.error('Error creating time block:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Mark a time block as completed
+   * @param {string} blockUID - Time block UID
+   * @returns {boolean} Success status
+   */
+  function markTimeBlockComplete(blockUID) {
+    if (!blockUID) return false;
+    
+    try {
+      const blockText = getBlockText(blockUID);
+      if (!blockText) return false;
+      
+      // Replace TODO with DONE
+      const updatedText = blockText.replace('{{[[TODO]]}}', '{{[[DONE]]}}');
+      const success = updateBlockText(blockUID, updatedText);
+      
+      if (success) {
+        // Calculate and add actual duration
+        const timeBlock = parseTimeBlock(blockUID);
+        if (timeBlock && timeBlock.metadata.estimatedDuration) {
+          // For now, use estimated duration as actual duration
+          // In a more sophisticated implementation, this would calculate based on actual time tracking
+          const actualDuration = timeBlock.metadata.estimatedDuration;
+          createChildBlock(blockUID, `ActualDuration:: ${actualDuration}`, 100);
+        }
+        
+        console.log('Time block marked as complete:', blockUID);
+        return true;
+      }
+      
+      return false;
+    } catch (error) {
+      console.error('Error marking time block complete:', error);
+      return false;
+    }
+  }
+
+  /**
+   * Get today's page title in Roam format
+   * @returns {string} Today's page title
+   */
+  function getTodayPageTitle() {
+    if (window.roamAlphaAPI && window.roamAlphaAPI.util && window.roamAlphaAPI.util.dateToPageTitle) {
+      return window.roamAlphaAPI.util.dateToPageTitle(new Date());
+    }
+    
+    // Fallback format: "January 15th, 2025"
+    const today = new Date();
+    const months = ['January', 'February', 'March', 'April', 'May', 'June',
+                   'July', 'August', 'September', 'October', 'November', 'December'];
+    const day = today.getDate();
+    const month = months[today.getMonth()];
+    const year = today.getFullYear();
+    
+    const suffix = day % 10 === 1 && day !== 11 ? 'st' :
+                   day % 10 === 2 && day !== 12 ? 'nd' :
+                   day % 10 === 3 && day !== 13 ? 'rd' : 'th';
+    
+    return `${month} ${day}${suffix}, ${year}`;
+  }
+
+  /**
+   * Get or create a daily note page
+   * @param {string} pageTitle - Page title to get or create
+   * @returns {string|null} Page UID or null if failed
+   */
+  function getOrCreateDailyNotePage(pageTitle) {
+    try {
+      if (window.roamAlphaAPI && window.roamAlphaAPI.q) {
+        // Try to find existing page
+        const query = `[:find ?e :where [?e :node/title "${pageTitle}"]]`;
+        const results = window.roamAlphaAPI.q(query);
+        
+        if (results && results.length > 0) {
+          // Get UID of existing page
+          const pageQuery = `[:find (pull ?e [:block/uid]) :where [?e :node/title "${pageTitle}"]]`;
+          const pageResults = window.roamAlphaAPI.q(pageQuery);
+          if (pageResults && pageResults.length > 0) {
+            return pageResults[0][0][':block/uid'];
+          }
+        }
+        
+        // Page doesn't exist, would need to create it
+        // For now, return null and let user create manually
+        console.warn(`Daily note page "${pageTitle}" not found. Please create it manually.`);
+        return null;
+      }
+      
+      return null;
+    } catch (error) {
+      console.error('Error getting/creating daily note page:', error);
+      return null;
+    }
+  }
+
+  // =============================================================================
+  // CONFLICT DETECTION AND SCHEDULE ANALYSIS
+  // =============================================================================
+
+  /**
+   * Find all time blocks for a specific date
+   * @param {string} date - Date in page title format (optional, defaults to today)
+   * @returns {Array} Array of time block objects
+   */
+  function getTimeBlocksForDate(date) {
+    const pageTitle = date || getTodayPageTitle();
+    
+    try {
+      if (window.roamAlphaAPI && window.roamAlphaAPI.q) {
+        // Find the page
+        const pageQuery = `[:find ?p :where [?p :node/title "${pageTitle}"]]`;
+        const pageResults = window.roamAlphaAPI.q(pageQuery);
+        
+        if (!pageResults || pageResults.length === 0) {
+          return [];
+        }
+        
+        // Find all blocks on the page that match time block pattern
+        const blocksQuery = `[:find (pull ?b [:block/uid :block/string])
+                              :where 
+                              [?p :node/title "${pageTitle}"]
+                              [?p :block/children ?b]
+                              [?b :block/string ?text]
+                              [(clojure.string/includes? ?text "{{[[")]]`;
+        
+        const blockResults = window.roamAlphaAPI.q(blocksQuery);
+        const timeBlocks = [];
+        
+        blockResults.forEach(([block]) => {
+          const uid = block[':block/uid'];
+          const text = block[':block/string'];
+          
+          if (isTimeBlock(text)) {
+            const timeBlock = parseTimeBlock(uid);
+            if (timeBlock) {
+              timeBlocks.push(timeBlock);
+            }
+          }
+        });
+        
+        return timeBlocks.sort((a, b) => {
+          const aStart = parseTimeString(a.timeRange.start);
+          const bStart = parseTimeString(b.timeRange.start);
+          return aStart - bStart;
+        });
+      }
+      
+      return [];
+    } catch (error) {
+      console.error('Error getting time blocks for date:', error);
+      return [];
+    }
+  }
+
+  /**
+   * Find conflicts with a new time block
+   * @param {Object} newTimeBlock - New time block data
+   * @param {string} date - Date to check (optional, defaults to today)
+   * @returns {Array} Array of conflicting time blocks
+   */
+  function findTimeConflicts(newTimeBlock, date) {
+    const existingBlocks = getTimeBlocksForDate(date);
+    const conflicts = [];
+    
+    const newBlock = {
+      timeRange: {
+        start: newTimeBlock.startTime,
+        end: newTimeBlock.endTime
+      }
+    };
+    
+    existingBlocks.forEach(existingBlock => {
+      if (timeBlocksOverlap(newBlock, existingBlock)) {
+        conflicts.push(existingBlock);
+      }
+    });
+    
+    return conflicts;
+  }
+
+  /**
+   * Get currently active time block
+   * @param {string} date - Date to check (optional, defaults to today)
+   * @returns {Object|null} Active time block or null
+   */
+  function getCurrentActiveTimeBlock(date) {
+    const timeBlocks = getTimeBlocksForDate(date);
+    
+    // Find block that contains current time and is not completed
+    const now = new Date();
+    const currentTimeMinutes = now.getHours() * 60 + now.getMinutes();
+    
+    return timeBlocks.find(block => {
+      if (block.isCompleted) return false;
+      
+      const startMinutes = parseTimeString(block.timeRange.start);
+      const endMinutes = parseTimeString(block.timeRange.end);
+      
+      return currentTimeMinutes >= startMinutes && currentTimeMinutes < endMinutes;
+    }) || null;
+  }
+
+  /**
+   * Validate entire day schedule for common issues
+   * @param {string} date - Date to validate (optional, defaults to today)
+   * @returns {Object} Validation result with warnings and suggestions
+   */
+  function validateDaySchedule(date) {
+    const timeBlocks = getTimeBlocksForDate(date);
+    const warnings = [];
+    const suggestions = [];
+    
+    if (timeBlocks.length === 0) {
+      return {
+        isValid: true,
+        warnings: ['No time blocks scheduled'],
+        suggestions: ['Consider adding time blocks for better day structure']
+      };
+    }
+    
+    // Check for high-priority morning block ("eat the frog")
+    const morningBlocks = timeBlocks.filter(block => {
+      const startMinutes = parseTimeString(block.timeRange.start);
+      return startMinutes <= parseTimeString("10:30");
+    });
+    
+    const hasFrogBlock = morningBlocks.some(block => 
+      block.priorities.daily >= 4 && 
+      block.metadata.estimatedDuration <= 90
+    );
+    
+    if (!hasFrogBlock) {
+      warnings.push('No high-priority morning block found');
+      suggestions.push('Add a high-priority task (priority 4-5) in the morning, max 90 minutes');
+    }
+    
+    // Check for email boundaries
+    const hasEarlyEmail = timeBlocks.some(block =>
+      block.context === 'logistics' && 
+      parseTimeString(block.timeRange.start) >= parseTimeString("10:00") &&
+      parseTimeString(block.timeRange.end) <= parseTimeString("11:30")
+    );
+    
+    const hasEveningWrapUp = timeBlocks.some(block =>
+      block.context === 'logistics' &&
+      parseTimeString(block.timeRange.start) >= parseTimeString("16:00")
+    );
+    
+    if (!hasEarlyEmail || !hasEveningWrapUp) {
+      warnings.push('Email boundaries not properly set');
+      suggestions.push('Schedule email check before 11:30am and evening wrap-up after 4pm');
+    }
+    
+    // Check for lunch break
+    const hasLunchBreak = timeBlocks.some((block, index) => {
+      if (index === 0) return false;
+      const prevBlock = timeBlocks[index - 1];
+      const gap = parseTimeString(block.timeRange.start) - parseTimeString(prevBlock.timeRange.end);
+      return gap >= 30 && parseTimeString(prevBlock.timeRange.end) >= parseTimeString("12:00");
+    });
+    
+    if (!hasLunchBreak) {
+      warnings.push('No lunch break detected');
+      suggestions.push('Consider adding a 30-60 minute lunch break');
+    }
+    
+    // Check day length
+    if (timeBlocks.length > 0) {
+      const firstStart = parseTimeString(timeBlocks[0].timeRange.start);
+      const lastEnd = parseTimeString(timeBlocks[timeBlocks.length - 1].timeRange.end);
+      const dayLength = lastEnd - firstStart;
+      
+      if (dayLength > 480) { // More than 8 hours
+        warnings.push('Work day exceeds 8 hours');
+        suggestions.push('Consider reducing scheduled work time for better work-life balance');
+      }
+    }
+    
+    return {
+      isValid: warnings.length === 0,
+      warnings,
+      suggestions
+    };
+  }
+
+  // =============================================================================
+  // MODULE PUBLIC INTERFACE
+  // =============================================================================
+
+  /**
+   * Module 2 Public Interface
+   * Functions available to other modules
+   */
+  const TimeBlockSystem = {
+    // Core parsing and validation
+    parseTimeBlock,
+    parseTimeBlockFromText,
+    isTimeBlock,
+    validateTimeBlockData,
+    validatePriorities,
+    
+    // Time utilities
+    parseTimeString,
+    formatTimeFromMinutes,
+    calculateDuration,
+    getCurrentTimeRemaining,
+    timeBlocksOverlap,
+    
+    // Block management
+    createTimeBlock,
+    markTimeBlockComplete,
+    getTimeBlocksForDate,
+    getCurrentActiveTimeBlock,
+    
+    // Conflict detection
+    findTimeConflicts,
+    validateDaySchedule,
+    
+    // Metadata extraction
+    extractBlockMetadata,
+    
+    // Roam integration
+    getBlockText,
+    updateBlockText,
+    createChildBlock,
+    getBlockChildren,
+    
+    // Constants
+    LEGAL_CONTEXTS,
+    DEFAULT_MINIMUM_TIMES
+  };
+
+  // Export to global scope for other modules
+  if (typeof window !== 'undefined') {
+    window.RoamFlow = window.RoamFlow || {};
+    window.RoamFlow.TimeBlockSystem = TimeBlockSystem;
+  }
+
+  console.log('RoamFlow Module 2: Time Block System loaded successfully');
+  
+  return TimeBlockSystem;
+
+})();
