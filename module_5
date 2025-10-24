@@ -1,0 +1,885 @@
+/**
+ * Module 5: Dynamic Block Reallocation
+ * 
+ * Simplified reallocation system for RoamFlow legal practice optimization.
+ * When long tasks end early (≥30min remaining), intelligently suggests next actions
+ * using cascading priority logic: Same Case + Urgent → Today → Tomorrow → Next Scheduled → Rest
+ */
+
+(() => {
+  'use strict';
+
+  // Ensure required modules are available
+  if (!window.RoamFlow?.TimeBlockSystem) {
+    console.error('Module 5 requires Module 2: Time Block System');
+    return;
+  }
+  
+  if (!window.RoamFlow?.TaskDetection) {
+    console.error('Module 5 requires Module 3: Task Detection & State');
+    return;
+  }
+
+  if (!window.RoamFlow?.PriorityScoringEngine) {
+    console.error('Module 5 requires Module 4: Priority & Scoring Engine');
+    return;
+  }
+
+  const TimeBlockSystem = window.RoamFlow.TimeBlockSystem;
+  const TaskDetection = window.RoamFlow.TaskDetection;
+  const PriorityScoringEngine = window.RoamFlow.PriorityScoringEngine;
+
+  // =============================================================================
+  // CONSTANTS AND CONFIGURATION
+  // =============================================================================
+
+  const REALLOCATION_CONFIG = {
+    // Trigger thresholds
+    MIN_REMAINING_TIME: 30,        // Minimum minutes to trigger reallocation
+    MIN_ORIGINAL_DURATION: 60,     // Original block must be ≥60min to trigger
+    EARLY_END_THRESHOLD: 0.3,      // Must have ≥30% of time remaining
+    
+    // Same case search parameters
+    MAX_URGENT_DAYS: 2,            // Look for urgent tasks within 2 days
+    
+    // Rest break recommendations
+    MAX_CONTINUOUS_WORK: 180,      // 3 hours continuous work suggests break
+    HIGH_STRESS_THRESHOLD: 7,      // Stress level 7+ suggests break
+    
+    // Time fit tolerances
+    SETUP_TIME_BUFFER: 5,          // 5 minute buffer for task setup
+    MIN_PRODUCTIVE_TIME: 15        // Minimum productive work time after setup
+  };
+
+  const DATE_REFERENCE_PATTERNS = {
+    DEADLINE: /Deadline::\s*\[\[([^\]]+)\]\]/i,
+    DUE_DATE: /Due::\s*\[\[([^\]]+)\]\]/i,
+    SCHEDULED: /Scheduled::\s*\[\[([^\]]+)\]\]/i,
+    DIARY: /Diary::\s*\[\[([^\]]+)\]\]/i,
+    DATE_TAG: /\[\[([A-Z][a-z]+ \d{1,2}(?:st|nd|rd|th)?, \d{4})\]\]/g
+  };
+
+  // =============================================================================
+  // TRIGGER DETECTION
+  // =============================================================================
+
+  /**
+   * Check if reallocation should be triggered for a time block
+   * @param {Object} timeBlock - Current time block
+   * @returns {Object} Trigger assessment
+   */
+  function shouldTriggerReallocation(timeBlock) {
+    if (!timeBlock || timeBlock.isCompleted) {
+      return { shouldTrigger: false, reason: 'Block not active or already completed' };
+    }
+
+    const timeRemaining = TimeBlockSystem.getCurrentTimeRemaining(timeBlock);
+    const originalDuration = timeBlock.metadata?.estimatedDuration || 
+                           TimeBlockSystem.calculateDuration(timeBlock.timeRange.start, timeBlock.timeRange.end);
+
+    // Check minimum thresholds
+    if (timeRemaining < REALLOCATION_CONFIG.MIN_REMAINING_TIME) {
+      return { shouldTrigger: false, reason: `Only ${timeRemaining} minutes remaining (minimum: ${REALLOCATION_CONFIG.MIN_REMAINING_TIME})` };
+    }
+
+    if (originalDuration < REALLOCATION_CONFIG.MIN_ORIGINAL_DURATION) {
+      return { shouldTrigger: false, reason: `Original duration ${originalDuration}min too short (minimum: ${REALLOCATION_CONFIG.MIN_ORIGINAL_DURATION})` };
+    }
+
+    // Check early completion threshold
+    const remainingRatio = timeRemaining / originalDuration;
+    if (remainingRatio < REALLOCATION_CONFIG.EARLY_END_THRESHOLD) {
+      return { shouldTrigger: false, reason: `Only ${Math.round(remainingRatio * 100)}% time remaining (minimum: ${REALLOCATION_CONFIG.EARLY_END_THRESHOLD * 100}%)` };
+    }
+
+    return {
+      shouldTrigger: true,
+      timeRemaining: timeRemaining,
+      originalDuration: originalDuration,
+      remainingRatio: remainingRatio,
+      reason: `Early completion detected: ${timeRemaining}min remaining from ${originalDuration}min block`
+    };
+  }
+
+  /**
+   * Check if task fits within available time
+   * @param {Object} task - Task to check
+   * @param {number} availableTime - Available time in minutes
+   * @returns {boolean} True if task fits
+   */
+  function taskFitsInTime(task, availableTime) {
+    const setupTime = REALLOCATION_CONFIG.SETUP_TIME_BUFFER;
+    const estimatedDuration = PriorityScoringEngine.getTaskEstimatedDuration(task);
+    const totalNeeded = estimatedDuration + setupTime;
+    
+    return totalNeeded <= availableTime && 
+           (availableTime - setupTime) >= REALLOCATION_CONFIG.MIN_PRODUCTIVE_TIME;
+  }
+
+  // =============================================================================
+  // DATE REFERENCE DETECTION
+  // =============================================================================
+
+  /**
+   * Check if task has a date reference and extract the date
+   * @param {Object} task - Task to check
+   * @returns {Object} Date reference info
+   */
+  function extractDateReference(task) {
+    const text = task.rawText || task.title || '';
+    const dateRefs = [];
+
+    // Check for explicit date attributes
+    for (const [type, pattern] of Object.entries(DATE_REFERENCE_PATTERNS)) {
+      if (type === 'DATE_TAG') continue; // Handle separately
+      
+      const match = text.match(pattern);
+      if (match) {
+        const dateStr = match[1];
+        const parsedDate = PriorityScoringEngine.parseRoamDate(dateStr);
+        if (parsedDate) {
+          dateRefs.push({
+            type: type.toLowerCase(),
+            dateString: dateStr,
+            date: parsedDate,
+            daysFromNow: Math.ceil((parsedDate - new Date()) / (24 * 60 * 60 * 1000))
+          });
+        }
+      }
+    }
+
+    // Check for date tags in text
+    const dateTagMatches = text.matchAll(DATE_REFERENCE_PATTERNS.DATE_TAG);
+    for (const match of dateTagMatches) {
+      const dateStr = match[1];
+      const parsedDate = PriorityScoringEngine.parseRoamDate(dateStr);
+      if (parsedDate) {
+        dateRefs.push({
+          type: 'date_tag',
+          dateString: dateStr,
+          date: parsedDate,
+          daysFromNow: Math.ceil((parsedDate - new Date()) / (24 * 60 * 60 * 1000))
+        });
+      }
+    }
+
+    // Return the most urgent (closest) date reference
+    if (dateRefs.length === 0) {
+      return { hasDateRef: false };
+    }
+
+    const urgentRef = dateRefs.reduce((closest, current) => 
+      current.daysFromNow < closest.daysFromNow ? current : closest
+    );
+
+    return {
+      hasDateRef: true,
+      ...urgentRef,
+      allReferences: dateRefs
+    };
+  }
+
+  /**
+   * Check if date reference is within urgency threshold
+   * @param {Object} dateRef - Date reference object
+   * @param {number} maxDays - Maximum days to consider urgent
+   * @returns {boolean} True if urgent
+   */
+  function isUrgentDateReference(dateRef, maxDays = REALLOCATION_CONFIG.MAX_URGENT_DAYS) {
+    return dateRef.hasDateRef && dateRef.daysFromNow >= 0 && dateRef.daysFromNow <= maxDays;
+  }
+
+  // =============================================================================
+  // SAME CASE TASK FINDER
+  // =============================================================================
+
+  /**
+   * Find tasks on the same case with urgent date references
+   * @param {string} caseReference - Case reference to match
+   * @param {number} availableTime - Available time in minutes
+   * @param {number} maxDays - Maximum days for urgent consideration
+   * @returns {Array} Array of matching tasks
+   */
+  async function findSameCaseUrgentTasks(caseReference, availableTime, maxDays = REALLOCATION_CONFIG.MAX_URGENT_DAYS) {
+    if (!caseReference) {
+      return [];
+    }
+
+    try {
+      // Get all tasks (use cached results for speed)
+      const taskResult = await TaskDetection.getTasks({
+        method: 'auto',
+        limit: 200,
+        filters: { completed: false },
+        useCache: true
+      });
+
+      const sameCaseTasks = taskResult.tasks.filter(task => {
+        // Must be same case
+        if (!task.caseReference || task.caseReference !== caseReference) {
+          return false;
+        }
+
+        // Must fit in available time
+        if (!taskFitsInTime(task, availableTime)) {
+          return false;
+        }
+
+        // Must have urgent date reference
+        const dateRef = extractDateReference(task);
+        return isUrgentDateReference(dateRef, maxDays);
+      });
+
+      // Sort by urgency (closest date first)
+      sameCaseTasks.sort((a, b) => {
+        const aDateRef = extractDateReference(a);
+        const bDateRef = extractDateReference(b);
+        return aDateRef.daysFromNow - bDateRef.daysFromNow;
+      });
+
+      console.log(`Found ${sameCaseTasks.length} urgent same-case tasks for ${caseReference}`);
+      return sameCaseTasks;
+
+    } catch (error) {
+      console.error('Error finding same case urgent tasks:', error);
+      return [];
+    }
+  }
+
+  // =============================================================================
+  // TIME-BASED TASK FINDER
+  // =============================================================================
+
+  /**
+   * Get today's date in Roam format
+   * @returns {string} Today's date
+   */
+  function getTodayPageTitle() {
+    return TaskDetection.formatDateForRoam(new Date());
+  }
+
+  /**
+   * Get tomorrow's date in Roam format
+   * @returns {string} Tomorrow's date
+   */
+  function getTomorrowPageTitle() {
+    const tomorrow = new Date();
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    return TaskDetection.formatDateForRoam(tomorrow);
+  }
+
+  /**
+   * Find tasks scheduled for a specific date that fit available time
+   * @param {string} dateTitle - Roam page title for the date
+   * @param {number} availableTime - Available time in minutes
+   * @returns {Array} Array of tasks for that date
+   */
+  async function findTasksForDate(dateTitle, availableTime) {
+    try {
+      // Get tasks with time range covering the specific date
+      const startDate = PriorityScoringEngine.parseRoamDate(dateTitle);
+      if (!startDate) {
+        console.warn('Could not parse date:', dateTitle);
+        return [];
+      }
+
+      const endDate = new Date(startDate);
+      endDate.setHours(23, 59, 59, 999);
+
+      const taskResult = await TaskDetection.getTasks({
+        method: 'api', // Use API for date-specific queries
+        limit: 100,
+        timeRange: { start: startDate, end: endDate },
+        filters: { completed: false },
+        useCache: true
+      });
+
+      const fittingTasks = taskResult.tasks.filter(task => {
+        // Must fit in available time
+        if (!taskFitsInTime(task, availableTime)) {
+          return false;
+        }
+
+        // Prefer tasks that are explicitly scheduled for this date
+        // (either on the daily page or with date references to this date)
+        if (task.pageTitle === dateTitle) {
+          return true;
+        }
+
+        const dateRef = extractDateReference(task);
+        if (dateRef.hasDateRef && dateRef.dateString === dateTitle) {
+          return true;
+        }
+
+        return false;
+      });
+
+      // Sort by priority (using Module 4's scoring)
+      const scoredTasks = PriorityScoringEngine.scoreAndRankTasks(fittingTasks, {
+        availableTime: availableTime,
+        currentTime: new Date()
+      });
+
+      console.log(`Found ${fittingTasks.length} tasks for ${dateTitle} that fit in ${availableTime} minutes`);
+      return scoredTasks;
+
+    } catch (error) {
+      console.error(`Error finding tasks for date ${dateTitle}:`, error);
+      return [];
+    }
+  }
+
+  /**
+   * Find the next chronologically scheduled task
+   * @param {number} availableTime - Available time in minutes
+   * @returns {Object|null} Next scheduled task or null
+   */
+  async function findNextScheduledTask(availableTime) {
+    try {
+      // Look for tasks in the next week
+      const timeRange = TaskDetection.getDefaultTimeRange();
+      const endDate = new Date(timeRange.end);
+      endDate.setDate(endDate.getDate() + 7); // Extend to next week
+
+      const taskResult = await TaskDetection.getTasks({
+        method: 'api',
+        limit: 200,
+        timeRange: { start: new Date(), end: endDate },
+        filters: { completed: false },
+        useCache: true
+      });
+
+      // Find tasks with future date references
+      const futureTasks = taskResult.tasks
+        .filter(task => {
+          if (!taskFitsInTime(task, availableTime)) {
+            return false;
+          }
+
+          const dateRef = extractDateReference(task);
+          return dateRef.hasDateRef && dateRef.daysFromNow > 0;
+        })
+        .sort((a, b) => {
+          const aDateRef = extractDateReference(a);
+          const bDateRef = extractDateReference(b);
+          return aDateRef.daysFromNow - bDateRef.daysFromNow;
+        });
+
+      const nextTask = futureTasks[0] || null;
+      if (nextTask) {
+        console.log(`Next scheduled task: ${nextTask.title} (${extractDateReference(nextTask).daysFromNow} days away)`);
+      }
+
+      return nextTask;
+
+    } catch (error) {
+      console.error('Error finding next scheduled task:', error);
+      return null;
+    }
+  }
+
+  // =============================================================================
+  // REST BREAK LOGIC
+  // =============================================================================
+
+  /**
+   * Check if a rest break should be recommended
+   * @param {Object} context - Current work context
+   * @returns {Object} Break recommendation
+   */
+  function shouldRecommendBreak(context = {}) {
+    const {
+      continuousWorkTime = 0,    // Minutes of continuous work
+      stressLevel = 5,           // User stress level (1-10)
+      energyLevel = 5,           // User energy level (1-10)
+      timeOfDay = new Date(),    // Current time
+      lastBreakTime = null       // When last break was taken
+    } = context;
+
+    const reasons = [];
+    let shouldBreak = false;
+
+    // Check continuous work time
+    if (continuousWorkTime >= REALLOCATION_CONFIG.MAX_CONTINUOUS_WORK) {
+      reasons.push(`Continuous work for ${Math.round(continuousWorkTime / 60 * 10) / 10} hours`);
+      shouldBreak = true;
+    }
+
+    // Check stress level
+    if (stressLevel >= REALLOCATION_CONFIG.HIGH_STRESS_THRESHOLD) {
+      reasons.push(`High stress level (${stressLevel}/10)`);
+      shouldBreak = true;
+    }
+
+    // Check energy level
+    if (energyLevel <= 3) {
+      reasons.push(`Low energy level (${energyLevel}/10)`);
+      shouldBreak = true;
+    }
+
+    // Check time since last break
+    if (lastBreakTime) {
+      const timeSinceBreak = (Date.now() - lastBreakTime) / (1000 * 60); // minutes
+      if (timeSinceBreak >= 120) { // 2 hours since last break
+        reasons.push(`No break for ${Math.round(timeSinceBreak / 60 * 10) / 10} hours`);
+        shouldBreak = true;
+      }
+    }
+
+    // Check time of day patterns
+    const hour = timeOfDay.getHours();
+    if ((hour >= 12 && hour <= 13) || (hour >= 15 && hour <= 16)) {
+      // Natural break times (lunch or afternoon dip)
+      if (continuousWorkTime >= 90) { // Working for 1.5+ hours
+        reasons.push('Natural break time');
+        shouldBreak = true;
+      }
+    }
+
+    return {
+      shouldBreak,
+      reasons,
+      breakType: reasons.length > 2 ? 'long' : 'short',
+      recommendedDuration: reasons.length > 2 ? 15 : 10 // minutes
+    };
+  }
+
+  // =============================================================================
+  // MAIN REALLOCATION ORCHESTRATION
+  // =============================================================================
+
+  /**
+   * Execute the main reallocation logic
+   * @param {Object} timeBlock - Current time block that ended early
+   * @param {Object} context - Additional context (user state, work history, etc.)
+   * @returns {Object} Reallocation suggestions
+   */
+  async function executeReallocation(timeBlock, context = {}) {
+    console.log('Starting reallocation for time block:', timeBlock.blockUID);
+
+    // Step 1: Check if reallocation should be triggered
+    const triggerCheck = shouldTriggerReallocation(timeBlock);
+    if (!triggerCheck.shouldTrigger) {
+      return {
+        action: 'no_reallocation',
+        reason: triggerCheck.reason,
+        suggestions: []
+      };
+    }
+
+    const availableTime = triggerCheck.timeRemaining;
+    console.log(`Reallocation triggered: ${availableTime} minutes available`);
+
+    // Step 2: Check if rest break is recommended
+    const breakCheck = shouldRecommendBreak(context);
+    if (breakCheck.shouldBreak) {
+      return {
+        action: 'rest_break',
+        reason: 'Break recommended: ' + breakCheck.reasons.join(', '),
+        breakType: breakCheck.breakType,
+        duration: breakCheck.recommendedDuration,
+        suggestions: [{
+          type: 'break',
+          title: `Take a ${breakCheck.breakType} break`,
+          duration: breakCheck.recommendedDuration,
+          reason: breakCheck.reasons.join(', ')
+        }]
+      };
+    }
+
+    const suggestions = [];
+
+    // Step 3: Same case + urgent tasks (≤2 days)
+    if (timeBlock.caseReference) {
+      console.log(`Looking for urgent tasks on case: ${timeBlock.caseReference}`);
+      const sameCaseUrgent = await findSameCaseUrgentTasks(
+        timeBlock.caseReference, 
+        availableTime
+      );
+
+      if (sameCaseUrgent.length > 0) {
+        suggestions.push(...sameCaseUrgent.slice(0, 3).map(task => {
+          const dateRef = extractDateReference(task);
+          return {
+            type: 'same_case_urgent',
+            task: task,
+            priority: 'high',
+            reason: `Same case task due ${dateRef.dateString} (${dateRef.daysFromNow} days)`,
+            estimatedDuration: PriorityScoringEngine.getTaskEstimatedDuration(task)
+          };
+        }));
+
+        return {
+          action: 'same_case_urgent',
+          reason: `Found ${sameCaseUrgent.length} urgent tasks on ${timeBlock.caseReference}`,
+          availableTime: availableTime,
+          suggestions: suggestions
+        };
+      }
+    }
+
+    // Step 4: Today's tasks
+    console.log('Looking for tasks scheduled for today');
+    const todayTasks = await findTasksForDate(getTodayPageTitle(), availableTime);
+    
+    if (todayTasks.length > 0) {
+      suggestions.push(...todayTasks.slice(0, 3).map(task => ({
+        type: 'today_task',
+        task: task,
+        priority: 'medium',
+        reason: 'Scheduled for today',
+        estimatedDuration: PriorityScoringEngine.getTaskEstimatedDuration(task),
+        score: task.score
+      })));
+
+      return {
+        action: 'today_task',
+        reason: `Found ${todayTasks.length} tasks scheduled for today`,
+        availableTime: availableTime,
+        suggestions: suggestions
+      };
+    }
+
+    // Step 5: Tomorrow's tasks
+    console.log('Looking for tasks scheduled for tomorrow');
+    const tomorrowTasks = await findTasksForDate(getTomorrowPageTitle(), availableTime);
+    
+    if (tomorrowTasks.length > 0) {
+      suggestions.push(...tomorrowTasks.slice(0, 3).map(task => ({
+        type: 'tomorrow_task',
+        task: task,
+        priority: 'medium',
+        reason: 'Bring forward from tomorrow',
+        estimatedDuration: PriorityScoringEngine.getTaskEstimatedDuration(task),
+        score: task.score
+      })));
+
+      return {
+        action: 'tomorrow_task',
+        reason: `Found ${tomorrowTasks.length} tasks scheduled for tomorrow`,
+        availableTime: availableTime,
+        suggestions: suggestions
+      };
+    }
+
+    // Step 6: Next scheduled task
+    console.log('Looking for next chronologically scheduled task');
+    const nextTask = await findNextScheduledTask(availableTime);
+    
+    if (nextTask) {
+      const dateRef = extractDateReference(nextTask);
+      suggestions.push({
+        type: 'next_scheduled',
+        task: nextTask,
+        priority: 'low',
+        reason: `Bring forward from ${dateRef.dateString} (${dateRef.daysFromNow} days)`,
+        estimatedDuration: PriorityScoringEngine.getTaskEstimatedDuration(nextTask)
+      });
+
+      return {
+        action: 'next_scheduled',
+        reason: `Bringing forward task scheduled for ${dateRef.dateString}`,
+        availableTime: availableTime,
+        suggestions: suggestions
+      };
+    }
+
+    // Step 7: Default to break if no tasks found
+    return {
+      action: 'default_break',
+      reason: 'No suitable tasks found for reallocation',
+      availableTime: availableTime,
+      suggestions: [{
+        type: 'break',
+        title: 'Take a break',
+        duration: Math.min(availableTime, 15),
+        reason: 'No suitable tasks available'
+      }]
+    };
+  }
+
+  // =============================================================================
+  // USER INTERACTION INTERFACE
+  // =============================================================================
+
+  /**
+   * Present reallocation options to user
+   * @param {Object} reallocationResult - Result from executeReallocation
+   * @returns {Promise} User's choice
+   */
+  function presentReallocationOptions(reallocationResult) {
+    return new Promise((resolve) => {
+      createReallocationModal(reallocationResult, resolve);
+    });
+  }
+
+  /**
+   * Create modal for reallocation choices
+   * @param {Object} result - Reallocation result
+   * @param {Function} resolve - Promise resolver
+   */
+  function createReallocationModal(result, resolve) {
+    // Create modal overlay
+    const overlay = document.createElement('div');
+    overlay.style.cssText = `
+      position: fixed; top: 0; left: 0; width: 100%; height: 100%;
+      background: rgba(0,0,0,0.7); display: flex; align-items: center; justify-content: center;
+      z-index: 10000; font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+    `;
+
+    const modal = document.createElement('div');
+    modal.style.cssText = `
+      background: white; border-radius: 12px; padding: 24px; max-width: 600px; width: 90%;
+      box-shadow: 0 20px 60px rgba(0,0,0,0.3); max-height: 80vh; overflow-y: auto;
+    `;
+
+    // Header
+    const header = document.createElement('h2');
+    header.textContent = '⏰ Time Block Ended Early';
+    header.style.cssText = 'margin: 0 0 16px 0; color: #2563eb; font-size: 24px;';
+
+    // Description
+    const description = document.createElement('p');
+    description.textContent = `You have ${result.availableTime} minutes remaining. ${result.reason}`;
+    description.style.cssText = 'color: #6b7280; margin-bottom: 20px; line-height: 1.5;';
+
+    // Suggestions
+    const suggestionsContainer = document.createElement('div');
+    
+    if (result.suggestions.length === 0) {
+      suggestionsContainer.innerHTML = '<p style="color: #9ca3af; text-align: center;">No suggestions available</p>';
+    } else {
+      result.suggestions.forEach((suggestion, index) => {
+        const suggestionEl = document.createElement('div');
+        suggestionEl.style.cssText = `
+          border: 2px solid #e5e7eb; border-radius: 8px; padding: 16px; margin-bottom: 12px;
+          cursor: pointer; transition: all 0.2s; display: flex; justify-content: space-between; align-items: center;
+        `;
+
+        suggestionEl.onmouseover = () => suggestionEl.style.borderColor = '#3b82f6';
+        suggestionEl.onmouseout = () => suggestionEl.style.borderColor = '#e5e7eb';
+
+        const mainContent = document.createElement('div');
+        mainContent.innerHTML = `
+          <div style="font-weight: 600; color: #1f2937; margin-bottom: 4px;">
+            ${suggestion.task?.title || suggestion.title}
+          </div>
+          <div style="color: #6b7280; font-size: 14px; margin-bottom: 4px;">
+            ${suggestion.reason}
+          </div>
+          <div style="color: #9ca3af; font-size: 12px;">
+            Estimated: ${suggestion.estimatedDuration || suggestion.duration || 'Unknown'} minutes
+            ${suggestion.task?.caseReference ? ` • ${suggestion.task.caseReference}` : ''}
+          </div>
+        `;
+
+        const priorityBadge = document.createElement('div');
+        const priorityColors = {
+          'high': '#ef4444',
+          'medium': '#f59e0b', 
+          'low': '#10b981'
+        };
+        priorityBadge.style.cssText = `
+          background: ${priorityColors[suggestion.priority] || '#6b7280'};
+          color: white; padding: 4px 8px; border-radius: 4px; font-size: 12px; font-weight: 500;
+        `;
+        priorityBadge.textContent = suggestion.priority || 'normal';
+
+        suggestionEl.appendChild(mainContent);
+        suggestionEl.appendChild(priorityBadge);
+
+        suggestionEl.onclick = () => {
+          document.body.removeChild(overlay);
+          resolve({
+            action: 'accept_suggestion',
+            suggestion: suggestion,
+            index: index
+          });
+        };
+
+        suggestionsContainer.appendChild(suggestionEl);
+      });
+    }
+
+    // Action buttons
+    const actions = document.createElement('div');
+    actions.style.cssText = 'display: flex; gap: 12px; margin-top: 24px; justify-content: flex-end;';
+
+    const breakBtn = document.createElement('button');
+    breakBtn.textContent = 'Take Break Instead';
+    breakBtn.style.cssText = `
+      padding: 10px 20px; border: 2px solid #e5e7eb; background: white; 
+      border-radius: 6px; cursor: pointer; font-weight: 500;
+    `;
+    breakBtn.onclick = () => {
+      document.body.removeChild(overlay);
+      resolve({
+        action: 'take_break',
+        duration: Math.min(result.availableTime, 15)
+      });
+    };
+
+    const continueBtn = document.createElement('button');
+    continueBtn.textContent = 'Continue Current Block';
+    continueBtn.style.cssText = `
+      padding: 10px 20px; background: #6b7280; color: white; border: none; 
+      border-radius: 6px; cursor: pointer; font-weight: 500;
+    `;
+    continueBtn.onclick = () => {
+      document.body.removeChild(overlay);
+      resolve({
+        action: 'continue_current'
+      });
+    };
+
+    actions.appendChild(breakBtn);
+    actions.appendChild(continueBtn);
+
+    // Assemble modal
+    modal.appendChild(header);
+    modal.appendChild(description);
+    modal.appendChild(suggestionsContainer);
+    modal.appendChild(actions);
+    overlay.appendChild(modal);
+    document.body.appendChild(overlay);
+  }
+
+  /**
+   * Process user's reallocation choice
+   * @param {Object} choice - User's choice from modal
+   * @param {Object} originalTimeBlock - Original time block
+   * @returns {Object} Action result
+   */
+  async function processReallocationChoice(choice, originalTimeBlock) {
+    console.log('Processing reallocation choice:', choice.action);
+
+    switch (choice.action) {
+      case 'accept_suggestion':
+        return await executeTaskSuggestion(choice.suggestion, originalTimeBlock);
+        
+      case 'take_break':
+        return executeBreak(choice.duration);
+        
+      case 'continue_current':
+        return { success: true, action: 'continued_current_block' };
+        
+      default:
+        return { success: false, error: 'Unknown action: ' + choice.action };
+    }
+  }
+
+  /**
+   * Execute a task suggestion
+   * @param {Object} suggestion - Selected suggestion
+   * @param {Object} originalTimeBlock - Original time block
+   * @returns {Object} Execution result
+   */
+  async function executeTaskSuggestion(suggestion, originalTimeBlock) {
+    try {
+      if (suggestion.type === 'break') {
+        return executeBreak(suggestion.duration);
+      }
+
+      // For task suggestions, we would ideally:
+      // 1. Create a new time block for the suggested task
+      // 2. Update the original time block to mark completion
+      // 3. Focus user attention on the new task
+
+      console.log('Executing task suggestion:', suggestion.task?.title);
+
+      // Mark original block as completed if not already
+      if (!originalTimeBlock.isCompleted) {
+        TimeBlockSystem.markTimeBlockComplete(originalTimeBlock.blockUID);
+      }
+
+      // For now, return success with task info
+      // In a full implementation, this would create new time blocks
+      return {
+        success: true,
+        action: 'task_started',
+        task: suggestion.task,
+        estimatedDuration: suggestion.estimatedDuration,
+        reason: suggestion.reason
+      };
+
+    } catch (error) {
+      console.error('Error executing task suggestion:', error);
+      return {
+        success: false,
+        error: error.message
+      };
+    }
+  }
+
+  /**
+   * Execute a break
+   * @param {number} duration - Break duration in minutes
+   * @returns {Object} Break result
+   */
+  function executeBreak(duration) {
+    console.log(`Taking break for ${duration} minutes`);
+
+    // Could set a timer, update status, etc.
+    return {
+      success: true,
+      action: 'break_started',
+      duration: duration,
+      endTime: new Date(Date.now() + duration * 60 * 1000)
+    };
+  }
+
+  // =============================================================================
+  // MODULE PUBLIC INTERFACE
+  // =============================================================================
+
+  /**
+   * Module 5 Public Interface
+   * Functions available to other modules and external callers
+   */
+  const DynamicBlockReallocation = {
+    // Core reallocation logic
+    shouldTriggerReallocation,
+    executeReallocation,
+
+    // Task finding functions
+    findSameCaseUrgentTasks,
+    findTasksForDate,
+    findNextScheduledTask,
+
+    // Date and time utilities
+    extractDateReference,
+    isUrgentDateReference,
+    taskFitsInTime,
+
+    // Break logic
+    shouldRecommendBreak,
+
+    // User interaction
+    presentReallocationOptions,
+    processReallocationChoice,
+
+    // Configuration
+    REALLOCATION_CONFIG,
+
+    // Integration with other modules
+    TimeBlockSystem,
+    TaskDetection,
+    PriorityScoringEngine
+  };
+
+  // Export to global scope for other modules
+  if (typeof window !== 'undefined') {
+    window.RoamFlow = window.RoamFlow || {};
+    window.RoamFlow.DynamicBlockReallocation = DynamicBlockReallocation;
+  }
+
+  console.log('RoamFlow Module 5: Dynamic Block Reallocation loaded successfully');
+  console.log('Reallocation triggers:', {
+    minRemainingTime: REALLOCATION_CONFIG.MIN_REMAINING_TIME,
+    minOriginalDuration: REALLOCATION_CONFIG.MIN_ORIGINAL_DURATION,
+    earlyEndThreshold: REALLOCATION_CONFIG.EARLY_END_THRESHOLD
+  });
+
+  return DynamicBlockReallocation;
+
+})();
