@@ -1,0 +1,978 @@
+/**
+ * RoamFlow Module 4: Priority & Scoring Engine (COMPLETE)
+ * 
+ * Comprehensive priority calculation and task scoring system for RoamFlow.
+ * Integrates with legal practice workflow optimization, time blocks, and task detection.
+ * Provides dynamic scoring based on priorities, deadlines, context, energy, and momentum.
+ * 
+ * Dependencies: Module 2 (TimeBlockSystem), Module 3 (TaskDetection)
+ * Exports: window.RoamFlow.PriorityScoringEngine
+ */
+
+(() => {
+  'use strict';
+
+  // Ensure Modules 2 and 3 are available
+  if (!window.RoamFlow?.TimeBlockSystem) {
+    console.error('Module 4 requires Module 2: Time Block System');
+    return;
+  }
+  
+  if (!window.RoamFlow?.TaskDetection) {
+    console.error('Module 4 requires Module 3: Task Detection & State');
+    return;
+  }
+
+  const TimeBlockSystem = window.RoamFlow.TimeBlockSystem;
+  const TaskDetection = window.RoamFlow.TaskDetection;
+
+  // =============================================================================
+  // CONSTANTS AND CONFIGURATION
+  // =============================================================================
+
+  const SCORING_CONFIG = {
+    // Base priority weights
+    DAILY_WEIGHT: 0.7,        // Today's urgency matters more
+    WEEKLY_WEIGHT: 0.3,       // Strategic importance
+
+    // Deadline multipliers
+    DEADLINE_MULTIPLIERS: {
+      OVERDUE: 2.0,           // Due today or overdue
+      TODAY: 1.8,             // Due today
+      TOMORROW: 1.5,          // Due tomorrow  
+      THIS_WEEK: 1.2,         // Due within 2-3 days
+      NEXT_WEEK: 1.1,         // Due within 4-7 days
+      FUTURE: 1.0             // No urgency boost
+    },
+
+    // Time-of-day boosts for legal contexts
+    TIME_OF_DAY_BOOSTS: {
+      'evidence': { hours: [9, 10, 11], boost: 1.2 },      // Morning boost
+      'drafting': { hours: [9, 10, 11, 14, 15], boost: 1.15 }, // Morning + afternoon
+      'supervision': { hours: [10, 11, 14, 15, 16], boost: 1.1 }, // Mid-morning + afternoon
+      'client-contact': { hours: [10, 11, 14, 15], boost: 1.1 }, // Avoid very early/late
+      'practice-management': { hours: [9, 10, 16, 17], boost: 1.1 }, // Strategic times
+      'logistics': { hours: [11, 12, 16, 17], boost: 1.1 }, // Email/admin times
+      'finalising': { hours: [16, 17], boost: 1.05 }       // End-of-day cleanup
+    },
+
+    // Momentum boost multipliers
+    MOMENTUM_BOOSTS: {
+      RECENT_COMPLETION: 1.3,  // Just completed related task
+      ACTIVE_SESSION: 1.2,     // Currently working on case/project
+      RECENT_WORK: 1.1,        // Worked on recently (last 24h)
+      STALE_WORK: 0.9,         // Haven't worked on in >3 days
+      ABANDONED_WORK: 0.8      // Haven't touched in >1 week
+    },
+
+    // Energy level requirements for legal contexts
+    ENERGY_REQUIREMENTS: {
+      'evidence': { energy: 7, focus: 8, creativity: 6 },    // High focus for analysis
+      'drafting': { energy: 6, focus: 8, creativity: 7 },    // Creative + focused
+      'supervision': { energy: 6, focus: 6, creativity: 5 },  // Interpersonal skills
+      'client-contact': { energy: 7, focus: 6, creativity: 5 }, // High energy for clients
+      'practice-management': { energy: 5, focus: 7, creativity: 8 }, // Strategic thinking
+      'logistics': { energy: 4, focus: 5, creativity: 3 },   // Low barrier tasks
+      'finalising': { energy: 5, focus: 7, creativity: 3 }   // Detail-oriented
+    },
+
+    // Context switching costs (penalties)
+    CONTEXT_SWITCH_COSTS: {
+      'evidence': { 
+        'drafting': 0.1, 'finalising': 0.05, 'supervision': 0.2, 
+        'client-contact': 0.3, 'practice-management': 0.2, 'logistics': 0.3 
+      },
+      'drafting': { 
+        'evidence': 0.1, 'finalising': 0.05, 'supervision': 0.2,
+        'client-contact': 0.3, 'practice-management': 0.15, 'logistics': 0.25
+      },
+      'supervision': { 
+        'evidence': 0.2, 'drafting': 0.2, 'finalising': 0.1,
+        'client-contact': 0.1, 'practice-management': 0.1, 'logistics': 0.15
+      },
+      'client-contact': { 
+        'evidence': 0.3, 'drafting': 0.3, 'finalising': 0.2,
+        'supervision': 0.1, 'practice-management': 0.15, 'logistics': 0.2
+      },
+      'practice-management': { 
+        'evidence': 0.2, 'drafting': 0.15, 'finalising': 0.1,
+        'supervision': 0.1, 'client-contact': 0.15, 'logistics': 0.1
+      },
+      'logistics': { 
+        'evidence': 0.3, 'drafting': 0.25, 'finalising': 0.05,
+        'supervision': 0.15, 'client-contact': 0.2, 'practice-management': 0.1
+      },
+      'finalising': { 
+        'evidence': 0.05, 'drafting': 0.05, 'supervision': 0.1,
+        'client-contact': 0.2, 'practice-management': 0.1, 'logistics': 0.05
+      }
+    },
+
+    // Score component weights
+    SCORE_WEIGHTS: {
+      PRIORITY: 0.35,         // Base priority score
+      DEADLINE: 0.25,         // Deadline urgency
+      TIME_FIT: 0.15,         // How well task fits available time
+      MOMENTUM: 0.10,         // Recent activity on task/case
+      ENERGY_MATCH: 0.10,     // User energy vs task requirements
+      CONTEXT_COST: 0.05      // Context switching penalty
+    },
+
+    // Validation bounds
+    MIN_SCORE: 0.0,
+    MAX_SCORE: 10.0,
+    MIN_PRIORITY: 1,
+    MAX_DAILY_PRIORITY: 5,
+    MAX_WEEKLY_PRIORITY: 10
+  };
+
+  // =============================================================================
+  // CORE PRIORITY CALCULATION
+  // =============================================================================
+
+  /**
+   * Calculate base priority score from daily and weekly priorities
+   * @param {number} dailyPriority - Daily priority (1-5)
+   * @param {number} weeklyPriority - Weekly priority (1-10)
+   * @param {Object} options - Additional options
+   * @returns {number} Base priority score (0-10)
+   */
+  function calculateBasePriority(dailyPriority, weeklyPriority, options = {}) {
+    // Validate inputs
+    if (!Number.isInteger(dailyPriority) || dailyPriority < 1 || dailyPriority > 5) {
+      throw new Error(`Daily priority must be 1-5, got: ${dailyPriority}`);
+    }
+    
+    if (!Number.isInteger(weeklyPriority) || weeklyPriority < 1 || weeklyPriority > 10) {
+      throw new Error(`Weekly priority must be 1-10, got: ${weeklyPriority}`);
+    }
+
+    const { 
+      dailyWeight = SCORING_CONFIG.DAILY_WEIGHT,
+      weeklyWeight = SCORING_CONFIG.WEEKLY_WEIGHT 
+    } = options;
+
+    // Normalize priorities to 0-10 scale
+    const normalizedDaily = (dailyPriority / 5) * 10;  // 1-5 → 0-10
+    const normalizedWeekly = weeklyPriority;           // Already 1-10
+
+    const basePriority = (normalizedDaily * dailyWeight) + (normalizedWeekly * weeklyWeight);
+    
+    return Math.max(0, Math.min(10, basePriority));
+  }
+
+  /**
+   * Apply deadline proximity multiplier to priority
+   * @param {number} basePriority - Base priority score
+   * @param {string|Date|null} deadline - Deadline date
+   * @param {Date} currentDate - Current date (for testing)
+   * @returns {number} Priority with deadline multiplier applied
+   */
+  function applyDeadlineMultiplier(basePriority, deadline, currentDate = new Date()) {
+    if (!deadline) {
+      return basePriority;
+    }
+
+    let deadlineDate;
+    if (typeof deadline === 'string') {
+      // Try to parse Roam date format or standard formats
+      deadlineDate = parseRoamDate(deadline) || new Date(deadline);
+    } else {
+      deadlineDate = new Date(deadline);
+    }
+
+    if (isNaN(deadlineDate.getTime())) {
+      console.warn('Invalid deadline date:', deadline);
+      return basePriority;
+    }
+
+    // Calculate days until deadline
+    const millisecondsPerDay = 24 * 60 * 60 * 1000;
+    const daysUntilDeadline = Math.ceil((deadlineDate - currentDate) / millisecondsPerDay);
+
+    let multiplier;
+    if (daysUntilDeadline <= 0) {
+      multiplier = SCORING_CONFIG.DEADLINE_MULTIPLIERS.OVERDUE;
+    } else if (daysUntilDeadline === 1) {
+      multiplier = SCORING_CONFIG.DEADLINE_MULTIPLIERS.TODAY;
+    } else if (daysUntilDeadline === 2) {
+      multiplier = SCORING_CONFIG.DEADLINE_MULTIPLIERS.TOMORROW;
+    } else if (daysUntilDeadline <= 3) {
+      multiplier = SCORING_CONFIG.DEADLINE_MULTIPLIERS.THIS_WEEK;
+    } else if (daysUntilDeadline <= 7) {
+      multiplier = SCORING_CONFIG.DEADLINE_MULTIPLIERS.NEXT_WEEK;
+    } else {
+      multiplier = SCORING_CONFIG.DEADLINE_MULTIPLIERS.FUTURE;
+    }
+
+    const adjustedPriority = basePriority * multiplier;
+    return Math.max(0, Math.min(10, adjustedPriority));
+  }
+
+  /**
+   * Apply time-of-day boost based on legal context and current time
+   * @param {number} priority - Current priority score
+   * @param {string} context - Legal context type
+   * @param {Date} currentTime - Current time (defaults to now)
+   * @returns {number} Priority with time-of-day boost applied
+   */
+  function applyTimeOfDayBoost(priority, context, currentTime = new Date()) {
+    const hour = currentTime.getHours();
+    const contextBoost = SCORING_CONFIG.TIME_OF_DAY_BOOSTS[context];
+    
+    if (!contextBoost) {
+      return priority;
+    }
+
+    const isOptimalTime = contextBoost.hours.includes(hour);
+    const multiplier = isOptimalTime ? contextBoost.boost : 1.0;
+    
+    const adjustedPriority = priority * multiplier;
+    return Math.max(0, Math.min(10, adjustedPriority));
+  }
+
+  // =============================================================================
+  // UTILITY FUNCTIONS
+  // =============================================================================
+
+  /**
+   * Parse Roam-style date strings
+   * @param {string} dateString - Date string in Roam format
+   * @returns {Date|null} Parsed date or null if invalid
+   */
+  function parseRoamDate(dateString) {
+    if (!dateString || typeof dateString !== 'string') {
+      return null;
+    }
+
+    try {
+      // Handle Roam format: "January 15th, 2025"
+      const roamDatePattern = /^(\w+)\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4})$/;
+      const match = dateString.match(roamDatePattern);
+      
+      if (match) {
+        const [, monthName, day, year] = match;
+        const monthNames = ['January', 'February', 'March', 'April', 'May', 'June',
+                           'July', 'August', 'September', 'October', 'November', 'December'];
+        const monthIndex = monthNames.indexOf(monthName);
+        
+        if (monthIndex !== -1) {
+          return new Date(parseInt(year), monthIndex, parseInt(day));
+        }
+      }
+
+      // Fall back to standard Date parsing
+      return new Date(dateString);
+    } catch (error) {
+      console.warn('Error parsing date:', dateString, error);
+      return null;
+    }
+  }
+
+  /**
+   * Check if activity is within specified hours
+   * @param {Date|string|number} timestamp - Activity timestamp
+   * @param {number} hours - Hours to check back from now
+   * @returns {boolean} True if activity is recent
+   */
+  function isRecentActivity(timestamp, hours = 2) {
+    try {
+      const activityTime = new Date(timestamp);
+      const hoursAgo = new Date(Date.now() - (hours * 60 * 60 * 1000));
+      return activityTime >= hoursAgo;
+    } catch (error) {
+      console.warn('Error checking activity recency:', error);
+      return false;
+    }
+  }
+
+  // =============================================================================
+  // MOMENTUM AND ACTIVITY SCORING
+  // =============================================================================
+
+  /**
+   * Calculate momentum score based on recent activity
+   * @param {Object} task - Task object
+   * @param {Object} userActivity - User activity data
+   * @returns {number} Momentum score (0-2.0 multiplier)
+   */
+  function calculateMomentumScore(task, userActivity = {}) {
+    const {
+      recentCompletions = [],
+      activeSessions = [],
+      recentWork = {},
+      currentContext = null
+    } = userActivity;
+
+    let momentumMultiplier = 1.0;
+
+    // Check for recent completion in same case or context
+    if (task.caseReference) {
+      const recentCaseWork = recentCompletions.find(completion => 
+        completion.caseReference === task.caseReference &&
+        isRecentActivity(completion.timestamp, 2) // Within 2 hours
+      );
+      
+      if (recentCaseWork) {
+        momentumMultiplier = SCORING_CONFIG.MOMENTUM_BOOSTS.RECENT_COMPLETION;
+      }
+    }
+
+    // Check for active session on same case/context
+    const activeSession = activeSessions.find(session => 
+      session.caseReference === task.caseReference ||
+      session.context === task.context
+    );
+    
+    if (activeSession && !isRecentActivity(activeSession.timestamp, 2)) {
+      momentumMultiplier = Math.max(momentumMultiplier, SCORING_CONFIG.MOMENTUM_BOOSTS.ACTIVE_SESSION);
+    }
+
+    // Check recent work on same context
+    if (task.context && recentWork[task.context]) {
+      const lastWork = recentWork[task.context];
+      if (isRecentActivity(lastWork.timestamp, 24)) { // Within 24 hours
+        momentumMultiplier = Math.max(momentumMultiplier, SCORING_CONFIG.MOMENTUM_BOOSTS.RECENT_WORK);
+      } else if (isRecentActivity(lastWork.timestamp, 72)) { // 3 days
+        momentumMultiplier = Math.min(momentumMultiplier, SCORING_CONFIG.MOMENTUM_BOOSTS.STALE_WORK);
+      } else {
+        momentumMultiplier = Math.min(momentumMultiplier, SCORING_CONFIG.MOMENTUM_BOOSTS.ABANDONED_WORK);
+      }
+    }
+
+    return Math.max(0.5, Math.min(2.0, momentumMultiplier));
+  }
+
+  // =============================================================================
+  // ENERGY AND CONTEXT MATCHING
+  // =============================================================================
+
+  /**
+   * Calculate energy match score between user state and task requirements
+   * @param {Object} task - Task object with context
+   * @param {Object} userState - User's current energy state
+   * @returns {number} Energy match score (0.5-1.5)
+   */
+  function calculateEnergyMatch(task, userState = {}) {
+    const { energyLevel = 5, focusLevel = 5, creativityLevel = 5, stressLevel = 5 } = userState;
+    
+    // Get energy requirements for task context
+    const requirements = SCORING_CONFIG.ENERGY_REQUIREMENTS[task.context];
+    if (!requirements) {
+      return 1.0; // Neutral if no requirements defined
+    }
+
+    // Calculate fit for each dimension
+    const energyFit = calculateDimensionFit(energyLevel, requirements.energy);
+    const focusFit = calculateDimensionFit(focusLevel, requirements.focus);
+    const creativityFit = calculateDimensionFit(creativityLevel, requirements.creativity);
+    
+    // Stress adjustment (higher stress reduces all performance)
+    const stressAdjustment = stressLevel <= 3 ? 1.1 :  // Low stress boost
+                            stressLevel <= 7 ? 1.0 :   // Normal
+                            0.9;                        // High stress penalty
+
+    // Weighted combination (focus is most important for legal work)
+    const weightedScore = (energyFit * 0.3) + (focusFit * 0.5) + (creativityFit * 0.2);
+    const finalScore = weightedScore * stressAdjustment;
+    
+    return Math.max(0.5, Math.min(1.5, finalScore));
+  }
+
+  /**
+   * Calculate fit between user level and requirement
+   * @param {number} userLevel - User's current level (1-10)
+   * @param {number} required - Required level (1-10)
+   * @returns {number} Fit score (0.5-1.5)
+   */
+  function calculateDimensionFit(userLevel, required) {
+    const difference = userLevel - required;
+    
+    if (difference >= 2) return 1.3;    // Surplus capacity
+    if (difference >= 0) return 1.0;    // Adequate capacity
+    if (difference >= -1) return 0.8;   // Slightly low
+    if (difference >= -2) return 0.6;   // Low capacity
+    return 0.5;                         // Very low capacity
+  }
+
+  // =============================================================================
+  // CONTEXT SWITCHING COST CALCULATION
+  // =============================================================================
+
+  /**
+   * Calculate context switching cost penalty
+   * @param {string} currentContext - Current context type
+   * @param {string} targetContext - Target task context
+   * @param {number} timeInCurrentContext - Minutes in current context
+   * @returns {number} Switching cost penalty (0-0.5)
+   */
+  function calculateContextSwitchCost(currentContext, targetContext, timeInCurrentContext = 0) {
+    // No penalty if staying in same context
+    if (currentContext === targetContext) {
+      return 0;
+    }
+
+    // Get base switching cost from matrix
+    const switchingCosts = SCORING_CONFIG.CONTEXT_SWITCH_COSTS[currentContext];
+    const baseCost = switchingCosts?.[targetContext] || 0.2; // Default moderate penalty
+
+    // Increase penalty based on time invested in current context
+    let timeMultiplier = 1.0;
+    if (timeInCurrentContext >= 60) {      // 1+ hour invested
+      timeMultiplier = 1.5;
+    } else if (timeInCurrentContext >= 30) { // 30+ minutes invested
+      timeMultiplier = 1.2;
+    }
+
+    const totalCost = baseCost * timeMultiplier;
+    return Math.max(0, Math.min(0.5, totalCost));
+  }
+
+  // =============================================================================
+  // TIME FIT SCORING
+  // =============================================================================
+
+  /**
+   * Calculate how well a task fits available time
+   * @param {Object} task - Task object
+   * @param {number} availableTime - Available time in minutes
+   * @returns {number} Time fit score (0-1.2)
+   */
+  function calculateTimeFitScore(task, availableTime) {
+    const estimatedDuration = getTaskEstimatedDuration(task);
+    
+    if (!estimatedDuration || availableTime <= 0) {
+      return 0.5; // Neutral score if no duration info
+    }
+
+    // Calculate fit quality
+    const ratio = availableTime / estimatedDuration;
+    
+    if (ratio < 0.5) {
+      return 0.1; // Insufficient time
+    }
+    
+    if (ratio >= 0.8 && ratio <= 1.3) {
+      return 1.2; // Excellent fit (80-130% of estimated time)
+    }
+    
+    if (ratio >= 0.6 && ratio <= 1.6) {
+      return 1.0; // Good fit (60-160% of estimated time)
+    }
+    
+    if (ratio >= 0.5 && ratio <= 2.0) {
+      return 0.8; // Acceptable fit
+    }
+    
+    // Too much time can be inefficient (Parkinson's Law)
+    if (ratio > 3.0) {
+      return 0.6; // Way too much time
+    }
+    
+    return 0.7; // Default for edge cases
+  }
+
+  /**
+   * Get estimated duration for a task
+   * @param {Object} task - Task object
+   * @returns {number} Estimated duration in minutes
+   */
+  function getTaskEstimatedDuration(task) {
+    // Check various sources for duration estimate
+    if (task.estimatedDuration) {
+      return task.estimatedDuration;
+    }
+    
+    if (task.timeBlockData?.estimatedDuration) {
+      return task.timeBlockData.estimatedDuration;
+    }
+    
+    if (task.metadata?.estimatedDuration) {
+      return task.metadata.estimatedDuration;
+    }
+    
+    // Default estimates by context type
+    const defaultDurations = {
+      'evidence': 45,
+      'drafting': 60,
+      'supervision': 30,
+      'client-contact': 45,
+      'practice-management': 60,
+      'logistics': 20,
+      'finalising': 30
+    };
+    
+    return defaultDurations[task.context] || 30;
+  }
+
+  // =============================================================================
+  // COMPREHENSIVE TASK SCORING
+  // =============================================================================
+
+  /**
+   * Calculate comprehensive score for a task
+   * @param {Object} task - Task object to score
+   * @param {Object} context - Current context information
+   * @returns {Object} Score breakdown and total
+   */
+  function calculateTaskScore(task, context = {}) {
+    const {
+      userState = {},
+      currentContext = null,
+      availableTime = 60,
+      userActivity = {},
+      currentTime = new Date(),
+      timeInCurrentContext = 0
+    } = context;
+
+    try {
+      // Extract priorities (with defaults)
+      const dailyPriority = task.dailyPriority || task.priorities?.daily || 3;
+      const weeklyPriority = task.weeklyPriority || task.priorities?.weekly || 5;
+
+      // Calculate base priority score
+      const basePriority = calculateBasePriority(dailyPriority, weeklyPriority);
+
+      // Apply deadline multiplier
+      const deadlineAdjusted = applyDeadlineMultiplier(basePriority, task.deadline, currentTime);
+
+      // Apply time-of-day boost
+      const timeAdjusted = applyTimeOfDayBoost(deadlineAdjusted, task.context, currentTime);
+
+      // Calculate component scores
+      const scores = {
+        priority: timeAdjusted,
+        timeFit: calculateTimeFitScore(task, availableTime),
+        momentum: calculateMomentumScore(task, userActivity),
+        energyMatch: calculateEnergyMatch(task, userState),
+        contextSwitchCost: calculateContextSwitchCost(
+          currentContext?.type, 
+          task.context, 
+          timeInCurrentContext
+        )
+      };
+
+      // Calculate weighted total score
+      const weights = SCORING_CONFIG.SCORE_WEIGHTS;
+      let totalScore = 
+        (scores.priority * weights.PRIORITY) +
+        (scores.timeFit * weights.TIME_FIT) +
+        (scores.momentum * weights.MOMENTUM) +
+        (scores.energyMatch * weights.ENERGY_MATCH) -
+        (scores.contextSwitchCost * weights.CONTEXT_COST);
+
+      // Apply bounds
+      totalScore = Math.max(SCORING_CONFIG.MIN_SCORE, Math.min(SCORING_CONFIG.MAX_SCORE, totalScore));
+
+      return {
+        totalScore: totalScore,
+        components: scores,
+        breakdown: {
+          basePriority: basePriority,
+          deadlineMultiplier: deadlineAdjusted / basePriority,
+          timeOfDayBoost: timeAdjusted / deadlineAdjusted,
+          finalPriority: timeAdjusted
+        },
+        metadata: {
+          taskId: task.id || task.blockUID,
+          context: task.context,
+          caseReference: task.caseReference,
+          availableTime: availableTime,
+          estimatedDuration: getTaskEstimatedDuration(task)
+        }
+      };
+
+    } catch (error) {
+      console.error('Error calculating task score:', error);
+      
+      // Return minimal valid score on error
+      return {
+        totalScore: 3.0,
+        components: {
+          priority: 3.0,
+          timeFit: 0.5,
+          momentum: 1.0,
+          energyMatch: 1.0,
+          contextSwitchCost: 0.2
+        },
+        breakdown: {
+          basePriority: 3.0,
+          deadlineMultiplier: 1.0,
+          timeOfDayBoost: 1.0,
+          finalPriority: 3.0
+        },
+        metadata: {
+          taskId: task.id || 'unknown',
+          context: task.context || 'unknown',
+          error: error.message
+        }
+      };
+    }
+  }
+
+  /**
+   * Score and rank multiple tasks
+   * @param {Array} tasks - Array of task objects
+   * @param {Object} context - Scoring context
+   * @returns {Array} Sorted array of scored tasks
+   */
+  function scoreAndRankTasks(tasks, context = {}) {
+    if (!Array.isArray(tasks) || tasks.length === 0) {
+      return [];
+    }
+
+    const scoredTasks = tasks.map(task => {
+      const scoreResult = calculateTaskScore(task, context);
+      return {
+        ...task,
+        score: scoreResult.totalScore,
+        scoreBreakdown: scoreResult
+      };
+    });
+
+    // Sort by score (highest first)
+    return scoredTasks.sort((a, b) => b.score - a.score);
+  }
+
+  // =============================================================================
+  // PRIORITY ADJUSTMENT AND LEARNING
+  // =============================================================================
+
+  /**
+   * Adjust task priorities based on user behavior patterns
+   * @param {Object} task - Task to adjust
+   * @param {Object} behaviorData - User behavior patterns
+   * @returns {Object} Adjusted task with modified priorities
+   */
+  function adjustPriorityBasedOnBehavior(task, behaviorData = {}) {
+    const {
+      completionPatterns = {},
+      procrastinationTriggers = [],
+      energyPatterns = {},
+      contextPreferences = {}
+    } = behaviorData;
+
+    let adjustedTask = { ...task };
+
+    // Adjust based on context preferences
+    if (contextPreferences[task.context]) {
+      const preference = contextPreferences[task.context];
+      if (preference.tendency === 'avoid') {
+        // Increase priority to counteract avoidance
+        adjustedTask.dailyPriority = Math.min(5, (adjustedTask.dailyPriority || 3) + 1);
+      } else if (preference.tendency === 'prefer') {
+        // Slight adjustment to reflect natural inclination
+        adjustedTask.weeklyPriority = Math.min(10, (adjustedTask.weeklyPriority || 5) + 1);
+      }
+    }
+
+    // Adjust based on completion patterns
+    if (task.caseReference && completionPatterns[task.caseReference]) {
+      const pattern = completionPatterns[task.caseReference];
+      if (pattern.averageDelay > 2) { // More than 2 days average delay
+        // Increase urgency to compensate
+        adjustedTask.dailyPriority = Math.min(5, (adjustedTask.dailyPriority || 3) + 1);
+      }
+    }
+
+    return adjustedTask;
+  }
+
+  /**
+   * Learn from task completion to improve future scoring
+   * @param {Object} completedTask - Recently completed task
+   * @param {Object} completionContext - Context when task was completed
+   * @returns {Object} Learning insights
+   */
+  function learnFromCompletion(completedTask, completionContext = {}) {
+    const {
+      actualDuration = 0,
+      userState = {},
+      effectiveness = null,
+      userSatisfaction = null
+    } = completionContext;
+
+    const insights = {
+      durationAccuracy: null,
+      energyOptimality: null,
+      contextEfficiency: null,
+      recommendations: []
+    };
+
+    // Duration accuracy analysis
+    const estimatedDuration = getTaskEstimatedDuration(completedTask);
+    if (estimatedDuration && actualDuration) {
+      const accuracy = 1 - Math.abs(actualDuration - estimatedDuration) / estimatedDuration;
+      insights.durationAccuracy = accuracy;
+      
+      if (accuracy < 0.7) {
+        insights.recommendations.push({
+          type: 'duration_estimation',
+          message: `Improve duration estimates for ${completedTask.context} tasks`,
+          data: { estimated: estimatedDuration, actual: actualDuration }
+        });
+      }
+    }
+
+    // Energy optimality analysis
+    if (userState.energyLevel && effectiveness) {
+      const energyRequirements = SCORING_CONFIG.ENERGY_REQUIREMENTS[completedTask.context];
+      if (energyRequirements) {
+        const energyMatch = calculateDimensionFit(userState.energyLevel, energyRequirements.energy);
+        insights.energyOptimality = energyMatch;
+        
+        if (energyMatch < 0.8 && effectiveness < 7) {
+          insights.recommendations.push({
+            type: 'energy_timing',
+            message: `Consider scheduling ${completedTask.context} tasks when energy is higher`,
+            data: { userEnergy: userState.energyLevel, required: energyRequirements.energy }
+          });
+        }
+      }
+    }
+
+    return insights;
+  }
+
+  // =============================================================================
+  // INTEGRATION WITH MODULES 2 AND 3
+  // =============================================================================
+
+  /**
+   * Score time blocks from Module 2
+   * @param {Array} timeBlocks - Time blocks to score
+   * @param {Object} context - Scoring context
+   * @returns {Array} Scored time blocks
+   */
+  function scoreTimeBlocks(timeBlocks, context = {}) {
+    return timeBlocks.map(timeBlock => {
+      // Convert time block to task-like object for scoring
+      const taskData = {
+        id: timeBlock.blockUID,
+        context: timeBlock.context,
+        caseReference: timeBlock.caseReference,
+        dailyPriority: timeBlock.priorities?.daily,
+        weeklyPriority: timeBlock.priorities?.weekly,
+        estimatedDuration: timeBlock.metadata?.estimatedDuration,
+        deadline: timeBlock.deadline,
+        completed: timeBlock.isCompleted,
+        isTimeBlock: true
+      };
+
+      const scoreResult = calculateTaskScore(taskData, {
+        ...context,
+        availableTime: timeBlock.timeRemaining || timeBlock.metadata?.estimatedDuration || 60
+      });
+
+      return {
+        ...timeBlock,
+        score: scoreResult.totalScore,
+        scoreBreakdown: scoreResult
+      };
+    });
+  }
+
+  /**
+   * Score tasks from Module 3
+   * @param {Array} tasks - Tasks from TaskDetection
+   * @param {Object} context - Scoring context
+   * @returns {Array} Scored tasks
+   */
+  function scoreDetectedTasks(tasks, context = {}) {
+    return scoreAndRankTasks(tasks, context);
+  }
+
+  // =============================================================================
+  // SCORE VALIDATION AND DEBUGGING
+  // =============================================================================
+
+  /**
+   * Validate score components
+   * @param {Object} scoreResult - Score result to validate
+   * @returns {Object} Validation result
+   */
+  function validateScoreResult(scoreResult) {
+    const errors = [];
+    const warnings = [];
+
+    // Check total score bounds
+    if (scoreResult.totalScore < SCORING_CONFIG.MIN_SCORE || 
+        scoreResult.totalScore > SCORING_CONFIG.MAX_SCORE) {
+      errors.push(`Total score ${scoreResult.totalScore} outside bounds [${SCORING_CONFIG.MIN_SCORE}, ${SCORING_CONFIG.MAX_SCORE}]`);
+    }
+
+    // Check component scores
+    Object.entries(scoreResult.components).forEach(([component, score]) => {
+      if (typeof score !== 'number' || isNaN(score)) {
+        errors.push(`Invalid ${component} score: ${score}`);
+      }
+    });
+
+    // Check for unusual patterns
+    if (scoreResult.components.priority > 8 && scoreResult.components.contextSwitchCost > 0.3) {
+      warnings.push('High priority task with high context switch cost - consider grouping similar tasks');
+    }
+
+    if (scoreResult.components.energyMatch < 0.6) {
+      warnings.push('Low energy match - consider scheduling when energy levels are higher');
+    }
+
+    return {
+      isValid: errors.length === 0,
+      errors,
+      warnings
+    };
+  }
+
+  /**
+   * Debug score calculation with detailed breakdown
+   * @param {Object} task - Task to debug
+   * @param {Object} context - Scoring context
+   * @returns {Object} Detailed debug information
+   */
+  function debugTaskScore(task, context = {}) {
+    const scoreResult = calculateTaskScore(task, context);
+    const validation = validateScoreResult(scoreResult);
+
+    return {
+      task: {
+        id: task.id,
+        title: task.title,
+        context: task.context,
+        caseReference: task.caseReference
+      },
+      scoreResult,
+      validation,
+      inputs: {
+        dailyPriority: task.dailyPriority || task.priorities?.daily || 3,
+        weeklyPriority: task.weeklyPriority || task.priorities?.weekly || 5,
+        deadline: task.deadline,
+        availableTime: context.availableTime || 60,
+        currentContext: context.currentContext?.type,
+        userState: context.userState
+      },
+      recommendations: generateScoreRecommendations(scoreResult, task, context)
+    };
+  }
+
+  /**
+   * Generate recommendations based on score analysis
+   * @param {Object} scoreResult - Score calculation result
+   * @param {Object} task - Original task
+   * @param {Object} context - Scoring context
+   * @returns {Array} Array of recommendations
+   */
+  function generateScoreRecommendations(scoreResult, task, context) {
+    const recommendations = [];
+
+    // Low time fit recommendations
+    if (scoreResult.components.timeFit < 0.6) {
+      if (context.availableTime < getTaskEstimatedDuration(task)) {
+        recommendations.push({
+          type: 'time_allocation',
+          message: 'Insufficient time for this task - consider breaking into smaller parts or allocating more time',
+          severity: 'high'
+        });
+      } else {
+        recommendations.push({
+          type: 'time_efficiency',
+          message: 'Task may take much longer than available time - consider if this is the best use of time',
+          severity: 'medium'
+        });
+      }
+    }
+
+    // Context switching recommendations
+    if (scoreResult.components.contextSwitchCost > 0.3) {
+      recommendations.push({
+        type: 'context_batching',
+        message: `High context switch cost - consider batching ${task.context} tasks together`,
+        severity: 'medium'
+      });
+    }
+
+    // Energy mismatch recommendations  
+    if (scoreResult.components.energyMatch < 0.7) {
+      const requirements = SCORING_CONFIG.ENERGY_REQUIREMENTS[task.context];
+      if (requirements) {
+        recommendations.push({
+          type: 'energy_timing',
+          message: `Task requires higher energy/focus levels - consider scheduling when ${requirements.energy > 6 ? 'energy' : 'focus'} is higher`,
+          severity: 'medium'
+        });
+      }
+    }
+
+    // Low momentum recommendations
+    if (scoreResult.components.momentum < 0.9) {
+      recommendations.push({
+        type: 'momentum_building',
+        message: 'No recent momentum on this case/context - consider warm-up activities or context switching',
+        severity: 'low'
+      });
+    }
+
+    return recommendations;
+  }
+
+  // =============================================================================
+  // MODULE PUBLIC INTERFACE
+  // =============================================================================
+
+  /**
+   * Module 4 Public Interface
+   * Functions available to other modules
+   */
+  const PriorityScoringEngine = {
+    // Core priority calculation
+    calculateBasePriority,
+    applyDeadlineMultiplier,
+    applyTimeOfDayBoost,
+    
+    // Comprehensive scoring
+    calculateTaskScore,
+    scoreAndRankTasks,
+    
+    // Component calculations
+    calculateMomentumScore,
+    calculateEnergyMatch,
+    calculateContextSwitchCost,
+    calculateTimeFitScore,
+    
+    // Integration with other modules
+    scoreTimeBlocks,
+    scoreDetectedTasks,
+    
+    // Behavior and learning
+    adjustPriorityBasedOnBehavior,
+    learnFromCompletion,
+    
+    // Utilities and debugging
+    validateScoreResult,
+    debugTaskScore,
+    generateScoreRecommendations,
+    getTaskEstimatedDuration,
+    parseRoamDate,
+    isRecentActivity,
+    
+    // Constants and configuration
+    SCORING_CONFIG,
+    
+    // Access to integrated modules
+    TimeBlockSystem,
+    TaskDetection
+  };
+
+  // Export to global scope for other modules
+  if (typeof window !== 'undefined') {
+    window.RoamFlow = window.RoamFlow || {};
+    window.RoamFlow.PriorityScoringEngine = PriorityScoringEngine;
+  }
+
+  console.log('RoamFlow Module 4: Priority & Scoring Engine loaded successfully');
+  console.log('Scoring components:', Object.keys(SCORING_CONFIG.SCORE_WEIGHTS));
+  console.log('Legal contexts supported:', Object.keys(SCORING_CONFIG.ENERGY_REQUIREMENTS));
+
+  return PriorityScoringEngine;
+
+})();
