@@ -1,0 +1,1696 @@
+/**
+ * RoamFlow Module 7: Main Controller & UI System
+ * 
+ * This module ties together all other modules and provides the missing
+ * functionality needed by the command palette integration.
+ * 
+ * Dependencies: Modules 1-5 must be loaded first
+ */
+
+(() => {
+  'use strict';
+
+  // Check all required modules
+  const requiredModules = ['Foundation', 'TimeBlockSystem', 'TaskDetection', 'PriorityScoringEngine', 'DynamicBlockReallocation'];
+  const missingModules = requiredModules.filter(m => !window.RoamFlow?.[m]);
+  
+  if (missingModules.length > 0) {
+    console.error('Module 7 requires these modules:', missingModules);
+    return;
+  }
+
+  // =============================================================================
+  // ROAMFLOW MAIN CONTROLLER CLASS
+  // =============================================================================
+
+  class RoamFlowController {
+    constructor() {
+      // Initialize state
+      this.energyLevel = this.loadSetting('energyLevel', 50);
+      this.stressLevel = this.loadSetting('stressLevel', 25);
+      this.focusLevel = this.loadSetting('focusLevel', 50);
+      this.creativityLevel = this.loadSetting('creativityLevel', 50);
+      
+      // UI state
+      this.isInterfaceVisible = false;
+      this.activeTab = 'dashboard';
+      this.container = null;
+      
+      // Table sorting and filtering state
+      this.sortColumn = 'priority';
+      this.sortDirection = 'desc';
+      this.taskFilter = null;
+      
+      // Cache
+      this.taskCache = null;
+      this.cacheTimestamp = null;
+      this.CACHE_DURATION = 5 * 60 * 1000; // 5 minutes
+      
+      // Bind methods to preserve context
+      this.toggleInterface = this.toggleInterface.bind(this);
+      this.registerRoamCommands = this.registerRoamCommands.bind(this);
+      
+      // Make instance globally accessible for command palette
+      window.RoamFlowInstance = this;
+      
+      // Initialize
+      this.init();
+    }
+
+    // =============================================================================
+    // INITIALIZATION
+    // =============================================================================
+
+    init() {
+      // Create UI container
+      this.createUIContainer();
+      
+      // Register commands
+      this.registerRoamCommands();
+      
+      // Start task monitoring
+      if (window.RoamFlow.TaskDetection) {
+        window.RoamFlow.TaskDetection.startTaskChangeObserver(() => {
+          this.taskCache = null; // Clear cache on changes
+        });
+      }
+      
+      console.log('RoamFlow Controller initialized');
+    }
+
+    // =============================================================================
+    // SETTINGS MANAGEMENT
+    // =============================================================================
+
+    loadSetting(key, defaultValue) {
+      try {
+        const stored = localStorage.getItem(`roamflow_${key}`);
+        return stored !== null ? parseInt(stored) : defaultValue;
+      } catch (error) {
+        console.warn('Error loading setting:', key, error);
+        return defaultValue;
+      }
+    }
+
+    saveSetting(key, value) {
+      try {
+        localStorage.setItem(`roamflow_${key}`, value.toString());
+      } catch (error) {
+        console.error('Error saving setting:', key, error);
+      }
+    }
+
+    saveMetrics() {
+      this.saveSetting('energyLevel', this.energyLevel);
+      this.saveSetting('stressLevel', this.stressLevel);
+      this.saveSetting('focusLevel', this.focusLevel);
+      this.saveSetting('creativityLevel', this.creativityLevel);
+      console.log('Metrics saved');
+    }
+
+    // =============================================================================
+    // TASK OPERATIONS
+    // =============================================================================
+
+    async fetchTasks(forceRefresh = false) {
+      // Check cache
+      if (!forceRefresh && this.taskCache && this.cacheTimestamp && 
+          Date.now() - this.cacheTimestamp < this.CACHE_DURATION) {
+        return this.taskCache;
+      }
+
+      try {
+        // Get tasks from Module 3
+        const tasks = await window.RoamFlow.TaskDetection.getAllTasks({
+          method: 'hybrid',
+          includeCompleted: true,
+          limit: 200
+        });
+
+        // Cache results
+        this.taskCache = tasks;
+        this.cacheTimestamp = Date.now();
+
+        return tasks;
+      } catch (error) {
+        console.error('Error fetching tasks:', error);
+        return [];
+      }
+    }
+
+    async getSmartRecommendation(context = {}) {
+      try {
+        const tasks = await this.fetchTasks();
+        const incompleteTasks = tasks.filter(t => !t.completed);
+
+        if (incompleteTasks.length === 0) {
+          return null;
+        }
+
+        // Build full context
+        const fullContext = {
+          userState: {
+            energyLevel: this.energyLevel,
+            focusLevel: this.focusLevel,
+            creativityLevel: this.creativityLevel,
+            stressLevel: this.stressLevel
+          },
+          currentTime: new Date(),
+          availableTime: 60, // Default, could be calculated
+          ...context
+        };
+
+        // Score and rank tasks
+        const scoredTasks = window.RoamFlow.PriorityScoringEngine.scoreAndRankTasks(
+          incompleteTasks,
+          fullContext
+        );
+
+        if (scoredTasks.length === 0) {
+          return null;
+        }
+
+        // Get top recommendation
+        const topTask = scoredTasks[0];
+        
+        // Generate reason based on score components
+        let reason = "Best match for current context";
+        if (topTask.scoreBreakdown) {
+          const components = topTask.scoreBreakdown.components;
+          if (components.priority > 8) reason = "High priority task";
+          else if (components.momentum > 1.2) reason = "Continue momentum on this case";
+          else if (components.energyMatch > 1.2) reason = "Perfect match for your energy level";
+          else if (components.timeFit > 1.0) reason = "Fits well in available time";
+        }
+
+        return {
+          task: topTask,
+          reason: reason,
+          alternativeTasks: scoredTasks.slice(1, 4) // Next 3 alternatives
+        };
+      } catch (error) {
+        console.error('Error getting smart recommendation:', error);
+        return null;
+      }
+    }
+
+    getTextByBlockUid(uid) {
+      if (window.RoamFlow.TimeBlockSystem) {
+        return window.RoamFlow.TimeBlockSystem.getBlockText(uid);
+      }
+      return null;
+    }
+
+    // =============================================================================
+    // UI MANAGEMENT - ROAM NATIVE VERSION
+    // =============================================================================
+
+    createUIContainer() {
+      // Remove existing container
+      if (this.container) {
+        this.container.remove();
+      }
+
+  // Create container using Roam's classes where possible
+      this.container = document.createElement('div');
+      this.container.id = 'roamflow-container';
+      this.container.className = 'bp3-elevation-3'; // Roam uses Blueprint.js
+      this.container.style.cssText = `
+        position: fixed;
+        top: 80px;
+        right: 20px;
+        width: 450px;
+        height: 600px;
+        z-index: 500;
+        display: none;
+        flex-direction: column;
+        resize: both;
+        overflow: hidden;
+        min-width: 350px;
+        min-height: 400px;
+        max-width: 80vw;
+        max-height: 80vh;
+        border-radius: 6px;
+        background: rgba(255, 255, 255, 0.98);
+        backdrop-filter: blur(10px);
+        border: 1px solid rgba(0, 0, 0, 0.1);
+      `;
+
+      // Add styles for priority badges
+      if (!document.getElementById('roamflow-styles')) {
+        const styles = document.createElement('style');
+        styles.id = 'roamflow-styles';
+        styles.textContent = `
+          .priority-high { background: #dcfce7 !important; color: #166534 !important; }
+          .priority-medium { background: #fef3c7 !important; color: #92400e !important; }
+          .priority-low { background: #fee2e2 !important; color: #991b1b !important; }
+          .priority-badge { transition: all 0.2s ease; }
+          .priority-badge:hover { transform: scale(1.05); }
+        `;
+        document.head.appendChild(styles);
+      }
+
+      // Header - let it inherit Roam's colors
+      const header = document.createElement('div');
+      header.className = 'rm-reference-main'; // Use Roam's reference styling
+      header.style.cssText = `
+        padding: 8px 12px;
+        display: flex;
+        justify-content: space-between;
+        align-items: center;
+        cursor: move;
+        border-radius: 6px 6px 0 0;
+        user-select: none;
+        flex-shrink: 0;
+      `;
+      header.innerHTML = `
+        <div style="display: flex; align-items: center; gap: 8px;">
+          <span style="font-size: 16px;">🎯</span>
+          <span style="font-weight: 600;">RoamFlow</span>
+        </div>
+        <button id="roamflow-close" class="bp3-button bp3-minimal bp3-small">✕</button>
+      `;
+
+      // Tabs - use Roam's tab styling
+      const tabsContainer = document.createElement('div');
+      tabsContainer.className = 'rm-reference-main'; // Inherits Roam's background
+      tabsContainer.style.cssText = `
+        display: flex;
+        border-bottom: 1px solid;
+        flex-shrink: 0;
+      `;
+      tabsContainer.innerHTML = `
+        <button class="roamflow-tab bp3-button bp3-minimal" data-tab="dashboard">Dashboard</button>
+        <button class="roamflow-tab bp3-button bp3-minimal" data-tab="tasks">Tasks</button>
+        <button class="roamflow-tab bp3-button bp3-minimal" data-tab="analytics">Analytics</button>
+      `;
+
+      // Content area - let it inherit Roam's main background
+      const content = document.createElement('div');
+      content.id = 'roamflow-content';
+      content.className = 'roam-article'; // Use Roam's main content class
+      content.style.cssText = `
+        flex: 1;
+        overflow-y: auto;
+        padding: 16px;
+      `;
+
+      // Assemble
+      this.container.appendChild(header);
+      this.container.appendChild(tabsContainer);
+      this.container.appendChild(content);
+      document.body.appendChild(this.container);
+
+      // Add functionality
+      this.makeDraggable(header);
+      this.addUIEventListeners();
+    }
+
+    makeDraggable(element) {
+      let isDragging = false;
+      let currentX;
+      let currentY;
+      let initialX;
+      let initialY;
+      let xOffset = 0;
+      let yOffset = 0;
+
+      const dragStart = (e) => {
+        initialX = e.clientX - xOffset;
+        initialY = e.clientY - yOffset; // Fixed: was initialY instead of yOffset
+        if (e.target === element || element.contains(e.target)) {
+          isDragging = true;
+        }
+      };
+
+      const drag = (e) => {
+        if (isDragging) {
+          e.preventDefault();
+          currentX = e.clientX - initialX;
+          currentY = e.clientY - initialY;
+          xOffset = currentX;
+          yOffset = currentY;
+          this.container.style.transform = `translate3d(${currentX}px, ${currentY}px, 0)`;
+        }
+      };
+
+      const dragEnd = (e) => {
+        initialX = currentX;
+        initialY = currentY;
+        isDragging = false;
+      };
+
+      element.addEventListener('mousedown', dragStart);
+      document.addEventListener('mousemove', drag);
+      document.addEventListener('mouseup', dragEnd);
+    }
+
+    addUIEventListeners() {
+      // Close button
+      const closeBtn = this.container.querySelector('#roamflow-close');
+      if (closeBtn) {
+        closeBtn.addEventListener('click', () => this.toggleInterface(false));
+      }
+
+      // Tab buttons
+      const tabs = this.container.querySelectorAll('.roamflow-tab');
+      tabs.forEach(tab => {
+        tab.addEventListener('click', () => {
+          const tabName = tab.getAttribute('data-tab');
+          this.setActiveTab(tabName);
+        });
+      });
+    }
+
+    toggleInterface(show = null) {
+      if (show === null) {
+        show = !this.isInterfaceVisible;
+      }
+
+      this.isInterfaceVisible = show;
+      this.container.style.display = show ? 'flex' : 'none';
+
+      if (show) {
+        this.renderInterface();
+      }
+    }
+
+    setActiveTab(tabName) {
+      this.activeTab = tabName;
+      
+      // Update tab styling using Roam's button states
+      const tabs = this.container.querySelectorAll('.roamflow-tab');
+      tabs.forEach(tab => {
+        const isActive = tab.getAttribute('data-tab') === tabName;
+        if (isActive) {
+          tab.classList.add('bp3-active');
+        } else {
+          tab.classList.remove('bp3-active');
+        }
+      });
+      
+      if (this.isInterfaceVisible) {
+        this.renderInterface();
+      }
+    }
+
+    renderInterface() {
+      const content = this.container.querySelector('#roamflow-content');
+      if (content) {
+        content.innerHTML = this.renderTabContent();
+      }
+    }
+
+    renderTabContent() {
+      switch (this.activeTab) {
+        case 'dashboard':
+          return this.renderDashboard();
+        case 'tasks':
+          return this.renderTaskList();
+        case 'analytics':
+          return this.renderAnalytics();
+        default:
+          return '<p>Unknown tab</p>';
+      }
+    }
+
+    // =============================================================================
+    // ROAM BLOCK RENDERING - Use Roam's Existing Structure
+    // =============================================================================
+
+    renderRoamBlock(task, index = 0) {
+      const blockText = task.title || task.rawText || 'Untitled Task';
+      const processedText = this.processRoamMarkup(blockText);
+      
+      // Use Roam's actual block structure classes
+      return `
+        <div class="roam-block-container" data-task-index="${index}">
+          <div class="rm-block-main">
+            <div class="rm-block-input">
+              <div class="rm-bullet-container">
+                <span class="rm-bullet ${task.completed ? 'rm-bullet-closed' : ''}" 
+                      onclick="window.RoamFlowInstance.toggleTaskCompletion('${task.blockUID || task.id}')">
+                  <span class="rm-bullet-inner"></span>
+                </span>
+              </div>
+              <div class="rm-block-text">
+                ${processedText}
+                ${this.renderTaskMetadata(task)}
+                ${this.renderTaskActions(task)}
+              </div>
+            </div>
+          </div>
+        </div>
+      `;
+    }
+
+    processRoamMarkup(text) {
+      if (!text) return '';
+      
+      let processedText = text.length > 200 ? text.substring(0, 200) + '...' : text;
+      
+      // Use Roam's actual CSS classes for references
+      processedText = processedText.replace(/\[\[([^\]]+)\]\]/g, (match, pageName) => {
+        return `<span class="rm-page-ref rm-page-ref-link-color" 
+                      onclick="window.roamAlphaAPI.ui.mainWindow.openPage({page: {title: '${pageName.replace(/'/g, "\\'")}'}})">
+                  <span class="rm-page-ref-brackets">[[</span>
+                  <span class="rm-page-ref-page-name">${pageName}</span>
+                  <span class="rm-page-ref-brackets">]]</span>
+                </span>`;
+      });
+      
+      // Use Roam's tag classes
+      processedText = processedText.replace(/#\[\[([^\]]+)\]\]/g, (match, tagName) => {
+        return `<span class="rm-page-ref rm-page-ref-tag" 
+                      onclick="window.roamAlphaAPI.ui.mainWindow.openPage({page: {title: '${tagName.replace(/'/g, "\\'")}'}})">
+                  #[[${tagName}]]
+                </span>`;
+      });
+      
+      // Simple hashtags
+      processedText = processedText.replace(/#(\w+)/g, (match, tagName) => {
+        return `<span class="rm-page-ref rm-page-ref-tag" 
+                      onclick="window.roamAlphaAPI.ui.mainWindow.openPage({page: {title: '${tagName}'}})">
+                  #${tagName}
+                </span>`;
+      });
+      
+      // Block references
+      processedText = processedText.replace(/\(\(([^)]+)\)\)/g, (match, blockUid) => {
+        return `<button class="rm-block-ref" 
+                        onclick="window.roamAlphaAPI.ui.rightSidebar.addWindow({window: {type: 'outline', 'block-uid': '${blockUid}'}})">
+                  ((${blockUid}))
+                </button>`;
+      });
+      
+      return processedText;
+    }
+
+    renderTaskMetadata(task) {
+      const metadata = [];
+      
+      if (task.context) {
+        metadata.push(`<span class="rm-page-ref-tag">📂 ${task.context}</span>`);
+      }
+      
+      if (task.caseReference) {
+        metadata.push(`<span class="rm-page-ref-tag">⚖️ ${task.caseReference}</span>`);
+      }
+      
+      if (task.isTimeBlock && task.timeRange) {
+        metadata.push(`<span class="rm-page-ref-tag">⏰ ${task.timeRange.start}-${task.timeRange.end}</span>`);
+      }
+      
+      if (task.deadline) {
+        metadata.push(`<span class="rm-page-ref-tag" style="color: #d9534f;">📅 ${task.deadline}</span>`);
+      }
+      
+      if (metadata.length === 0) return '';
+      
+      return `
+        <div style="margin-top: 4px; display: flex; flex-wrap: wrap; gap: 8px;">
+          ${metadata.join('')}
+        </div>
+      `;
+    }
+
+    renderTaskActions(task) {
+      const blockUID = task.blockUID || task.id || '';
+      
+      return `
+        <div style="margin-top: 8px; display: flex; gap: 6px; opacity: 0.7;">
+          ${blockUID ? `
+            <button class="bp3-button bp3-minimal bp3-small"
+                    onclick="window.RoamFlowInstance.openTaskInSidebar('${blockUID}')">
+              Open in Sidebar
+            </button>
+          ` : ''}
+          
+          <button class="bp3-button bp3-minimal bp3-small"
+                  onclick="window.RoamFlowInstance.showTaskDetails('${blockUID}')">
+            Details
+          </button>
+        </div>
+      `;
+    }
+
+    // =============================================================================
+    // TASK MANAGEMENT HELPERS
+    // =============================================================================
+
+    debugTaskCache() {
+      console.log('=== RoamFlow Task Cache Debug ===');
+      console.log('Cache exists:', !!this.taskCache);
+      console.log('Cache length:', this.taskCache?.length || 0);
+      console.log('Cache timestamp:', this.cacheTimestamp);
+      console.log('Cache age (ms):', this.cacheTimestamp ? Date.now() - this.cacheTimestamp : 'N/A');
+      
+      if (this.taskCache && this.taskCache.length > 0) {
+        console.log('First 3 tasks:', this.taskCache.slice(0, 3));
+        console.log('Task sources:', [...new Set(this.taskCache.map(t => t.source))]);
+        console.log('Completed tasks:', this.taskCache.filter(t => t.completed).length);
+        console.log('Incomplete tasks:', this.taskCache.filter(t => !t.completed).length);
+      }
+      
+      // Show in UI
+      alert(`Task Cache Debug:\n\nTotal: ${this.taskCache?.length || 0} tasks\nCompleted: ${this.taskCache?.filter(t => t.completed).length || 0}\nIncomplete: ${this.taskCache?.filter(t => !t.completed).length || 0}\n\nCheck console for detailed output.`);
+    }
+
+    async toggleTaskCompletion(taskId) {
+      console.log('Toggle task completion:', taskId);
+      
+      // Find the task in cache
+      const task = this.taskCache?.find(t => t.blockUID === taskId || t.id === taskId);
+      if (!task) {
+        console.error('Task not found:', taskId);
+        return;
+      }
+      
+      // For now, just toggle in cache (could integrate with Roam API later)
+      task.completed = !task.completed;
+      
+      // Re-render if tasks tab is active
+      if (this.isInterfaceVisible && this.activeTab === 'tasks') {
+        this.renderInterface();
+      }
+      
+      console.log('Task toggled:', task.title || task.rawText, 'completed:', task.completed);
+    }
+
+    openTaskInSidebar(blockUID) {
+      console.log('Opening task in sidebar:', blockUID);
+      
+      if (!blockUID) {
+        alert('No block UID available for this task');
+        return;
+      }
+
+      try {
+        // Use Roam API to open block in sidebar
+        window.roamAlphaAPI.ui.rightSidebar.addWindow({
+          window: {
+            type: 'outline',
+            'block-uid': blockUID
+          }
+        });
+        console.log('✅ Successfully opened block in sidebar');
+      } catch (error) {
+        console.error('❌ Failed to open block in sidebar:', error);
+        alert(`Failed to open block in sidebar: ${error.message}`);
+      }
+    }
+
+    showTaskDetails(blockUID) {
+      const task = this.taskCache?.find(t => t.blockUID === blockUID || t.id === blockUID);
+      
+      if (!task) {
+        console.log('Task not found for UID:', blockUID);
+        return;
+      }
+
+      console.log('=== Task Details ===');
+      console.log('Task:', task);
+      console.log('Title:', task.title || task.rawText);
+      console.log('Block UID:', task.blockUID);
+      console.log('Completed:', task.completed);
+      console.log('Source:', task.source);
+      console.log('Context:', task.context);
+      console.log('Case Reference:', task.caseReference);
+      console.log('Is Time Block:', task.isTimeBlock);
+      
+      // Show summary in alert
+      alert(`Task Details:\n\nTitle: ${task.title || task.rawText}\nUID: ${blockUID}\nCompleted: ${task.completed}\nSource: ${task.source || 'Unknown'}\n\nSee console for full details.`);
+    }
+
+    // =============================================================================
+    // TABLE MANAGEMENT METHODS
+    // =============================================================================
+
+    renderTaskRow(task, index) {
+      const childAttrs = this.extractChildAttributes(task);
+      const priorityScore = Math.round((task.score || 5) * 10);
+      const priorityClass = priorityScore >= 80 ? 'priority-high' : 
+                           priorityScore >= 60 ? 'priority-medium' : 'priority-low';
+      
+      return `
+        <tr style="border-bottom: 1px solid #f1f5f9;" onmouseover="this.style.background='#fafbfc'" onmouseout="this.style.background='white'">
+          <td style="padding: 8px 12px; vertical-align: top;">
+            <div class="roam-block-container">
+              <div class="rm-block-main">
+                <div class="rm-block-input">
+                  <div class="rm-bullet-container">
+                    <span class="rm-bullet" onclick="window.RoamFlowInstance.toggleTaskCompletion('${task.blockUID || task.id}')">
+                      <span class="rm-bullet-inner"></span>
+                    </span>
+                  </div>
+                  <div class="rm-block-text" style="max-width: 300px; overflow: hidden;">
+                    ${this.processRoamMarkup(task.title || task.rawText)}
+                  </div>
+                </div>
+              </div>
+            </div>
+          </td>
+          
+          <td style="padding: 8px 12px; text-align: center;">
+            <span class="priority-badge ${priorityClass}" style="padding: 3px 8px; border-radius: 12px; font-size: 11px; font-weight: 600;">
+              ${priorityScore}
+            </span>
+          </td>
+          
+          <td style="padding: 8px 12px;">
+            ${this.formatDeadline(task.deadline)}
+          </td>
+          
+          <td style="padding: 8px 12px; ${window.innerWidth < 768 ? 'display: none;' : ''}">
+            ${this.formatContext(task.context)}
+          </td>
+          
+          <td style="padding: 8px 12px; ${window.innerWidth < 768 ? 'display: none;' : ''}">
+            ${this.formatCase(task.caseReference)}
+          </td>
+          
+          <td style="padding: 8px 12px; text-align: center; ${window.innerWidth < 1024 ? 'display: none;' : ''}">
+            ${childAttrs.timeEstimate || ''}
+          </td>
+          
+          <td style="padding: 8px 12px; ${window.innerWidth < 1024 ? 'display: none;' : ''}">
+            <div style="max-width: 150px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;" 
+                 title="${childAttrs.notes || ''}">
+              ${childAttrs.notes || ''}
+            </div>
+          </td>
+          
+          <td style="padding: 8px 12px; font-size: 11px; color: #64748b; ${window.innerWidth < 1024 ? 'display: none;' : ''}">
+            ${this.formatDate(task.modifiedTime || task.createdTime)}
+          </td>
+          
+          <td style="padding: 8px 12px; font-size: 11px; color: #64748b; ${window.innerWidth < 1024 ? 'display: none;' : ''}">
+            ${task.source || 'Unknown'}
+          </td>
+          
+          <td style="padding: 8px 12px; ${window.innerWidth < 1024 ? 'display: none;' : ''}">
+            <div style="display: flex; gap: 4px;">
+              ${task.blockUID ? `
+                <button class="bp3-button bp3-minimal bp3-small" onclick="window.RoamFlowInstance.openTaskInSidebar('${task.blockUID}')" 
+                        title="Open in Sidebar" style="padding: 2px 6px; font-size: 10px;">
+                  📍
+                </button>
+              ` : ''}
+              <button class="bp3-button bp3-minimal bp3-small" onclick="window.RoamFlowInstance.showTaskDetails('${task.blockUID || task.id}')" 
+                      title="Show Details" style="padding: 2px 6px; font-size: 10px;">
+                👁
+              </button>
+            </div>
+          </td>
+        </tr>
+      `;
+    }
+
+    extractChildAttributes(task) {
+      const result = {
+        timeEstimate: '',
+        notes: ''
+      };
+
+      if (!task.children || !Array.isArray(task.children)) {
+        return result;
+      }
+
+      // Extract time estimates and notes from child blocks
+      const childTexts = task.children.map(child => child.text || child.string || '').filter(Boolean);
+      
+      // Look for time patterns
+      const timePatterns = [
+        /(?:est(?:imate)?:?\s*)?(\d+(?:\.\d+)?)\s*(?:h|hr|hrs|hour|hours)/i,
+        /(?:est(?:imate)?:?\s*)?(\d+(?:\.\d+)?)\s*(?:m|min|mins|minute|minutes)/i,
+        /(?:time:?\s*)?(\d+(?:\.\d+)?)\s*(?:h|hr|hrs|hour|hours)/i
+      ];
+
+      for (const text of childTexts) {
+        // Check for time estimates
+        for (const pattern of timePatterns) {
+          const match = text.match(pattern);
+          if (match && !result.timeEstimate) {
+            const value = parseFloat(match[1]);
+            const unit = text.includes('m') || text.includes('min') ? 'm' : 'h';
+            result.timeEstimate = `${value}${unit}`;
+            break;
+          }
+        }
+
+        // Look for note-like content (non-time, substantial text)
+        if (!result.notes && text.length > 10 && !timePatterns.some(p => p.test(text))) {
+          result.notes = text.length > 50 ? text.substring(0, 50) + '...' : text;
+        }
+      }
+
+      return result;
+    }
+
+    formatDeadline(deadline) {
+      if (!deadline) return '';
+      
+      const today = new Date();
+      const tomorrow = new Date(today);
+      tomorrow.setDate(tomorrow.getDate() + 1);
+      
+      let color = '#64748b';
+      let text = deadline;
+      
+      if (deadline.toLowerCase().includes('tomorrow') || deadline.toLowerCase().includes('today')) {
+        color = '#dc2626';
+        text = deadline;
+      } else if (deadline.toLowerCase().includes('friday') || deadline.toLowerCase().includes('week')) {
+        color = '#d97706';
+      }
+      
+      return `<span style="color: ${color}; font-weight: ${color !== '#64748b' ? '600' : '400'};">${text}</span>`;
+    }
+
+    formatContext(context) {
+      if (!context) return '';
+      
+      const contexts = Array.isArray(context) ? context : [context];
+      return contexts.map(ctx => 
+        `<span class="rm-page-ref-tag" style="background: #e0e7ff; color: #3730a3; padding: 2px 6px; border-radius: 8px; font-size: 10px; margin-right: 4px;">
+          ${ctx}
+        </span>`
+      ).join('');
+    }
+
+    formatCase(caseRef) {
+      if (!caseRef) return '';
+      
+      return `<span class="rm-page-ref-tag" style="background: #fef3c7; color: #92400e; padding: 2px 6px; border-radius: 8px; font-size: 10px;">
+        ${caseRef}
+      </span>`;
+    }
+
+    formatDate(timestamp) {
+      if (!timestamp) return '';
+      
+      const date = new Date(timestamp);
+      const now = new Date();
+      const diffMs = now - date;
+      const diffDays = Math.floor(diffMs / (1000 * 60 * 60 * 24));
+      
+      if (diffDays === 0) return 'Today';
+      if (diffDays === 1) return 'Yesterday';
+      if (diffDays < 7) return `${diffDays} days ago`;
+      if (diffDays < 30) return `${Math.floor(diffDays / 7)} weeks ago`;
+      
+      return date.toLocaleDateString();
+    }
+
+    sortTasks(tasks) {
+      if (!this.sortColumn) return tasks;
+      
+      return [...tasks].sort((a, b) => {
+        let aVal, bVal;
+        
+        switch (this.sortColumn) {
+          case 'task':
+            aVal = (a.title || a.rawText || '').toLowerCase();
+            bVal = (b.title || b.rawText || '').toLowerCase();
+            break;
+          case 'priority':
+            aVal = Math.round((a.score || 5) * 10);
+            bVal = Math.round((b.score || 5) * 10);
+            break;
+          case 'deadline':
+            aVal = a.deadline || 'zzzz';
+            bVal = b.deadline || 'zzzz';
+            break;
+          case 'context':
+            aVal = a.context || '';
+            bVal = b.context || '';
+            break;
+          case 'case':
+            aVal = a.caseReference || '';
+            bVal = b.caseReference || '';
+            break;
+          case 'time':
+            const aTime = this.extractChildAttributes(a).timeEstimate;
+            const bTime = this.extractChildAttributes(b).timeEstimate;
+            aVal = this.parseTimeValue(aTime);
+            bVal = this.parseTimeValue(bTime);
+            break;
+          case 'notes':
+            aVal = this.extractChildAttributes(a).notes || '';
+            bVal = this.extractChildAttributes(b).notes || '';
+            break;
+          case 'modified':
+            aVal = a.modifiedTime || a.createdTime || 0;
+            bVal = b.modifiedTime || b.createdTime || 0;
+            break;
+          case 'source':
+            aVal = a.source || '';
+            bVal = b.source || '';
+            break;
+          default:
+            return 0;
+        }
+        
+        if (typeof aVal === 'string' && typeof bVal === 'string') {
+          const result = aVal.localeCompare(bVal);
+          return this.sortDirection === 'asc' ? result : -result;
+        }
+        
+        const result = aVal - bVal;
+        return this.sortDirection === 'asc' ? result : -result;
+      });
+    }
+
+    parseTimeValue(timeStr) {
+      if (!timeStr) return 0;
+      
+      const match = timeStr.match(/(\d+(?:\.\d+)?)(h|m)/);
+      if (!match) return 0;
+      
+      const value = parseFloat(match[1]);
+      const unit = match[2];
+      
+      return unit === 'h' ? value * 60 : value; // Convert to minutes for comparison
+    }
+
+    getSortIcon(column) {
+      if (this.sortColumn !== column) {
+        return '<span style="opacity: 0.3;">↕</span>';
+      }
+      
+      return this.sortDirection === 'asc' ? '↑' : '↓';
+    }
+
+    sortBy(column) {
+      if (this.sortColumn === column) {
+        this.sortDirection = this.sortDirection === 'asc' ? 'desc' : 'asc';
+      } else {
+        this.sortColumn = column;
+        this.sortDirection = column === 'priority' ? 'desc' : 'asc';
+      }
+      
+      if (this.isInterfaceVisible && this.activeTab === 'tasks') {
+        this.renderInterface();
+      }
+    }
+
+    setTaskFilter(filter) {
+      this.taskFilter = filter;
+      
+      if (this.isInterfaceVisible && this.activeTab === 'tasks') {
+        this.renderInterface();
+      }
+    }
+
+    filterTasks(tasks) {
+      if (!this.taskFilter) return tasks;
+      
+      return tasks.filter(task => {
+        switch (this.taskFilter) {
+          case 'high-priority':
+            const score = Math.round((task.score || 5) * 10);
+            return score >= 80;
+          case 'due-soon':
+            const deadline = (task.deadline || '').toLowerCase();
+            return deadline.includes('today') || deadline.includes('tomorrow') || 
+                   deadline.includes('friday') || deadline.includes('week');
+          case 'legal':
+            const context = (task.context || '').toLowerCase();
+            return context.includes('legal');
+          default:
+            return true;
+        }
+      });
+    }
+
+    renderDashboard() {
+      return `
+        <div>
+          <!-- Energy & Stress Meters -->
+          <div style="margin-bottom: 24px;">
+            <h3 style="margin: 0 0 12px 0; font-size: 16px; color: #374151;">Current State</h3>
+            
+            <div style="margin-bottom: 12px;">
+              <div style="display: flex; justify-content: space-between; margin-bottom: 4px;">
+                <span style="font-size: 14px; color: #6b7280;">Energy</span>
+                <span style="font-size: 14px; font-weight: 600;">${this.energyLevel}/100</span>
+              </div>
+              <div style="height: 8px; background: #e5e7eb; border-radius: 4px; overflow: hidden;">
+                <div style="width: ${this.energyLevel}%; height: 100%; background: #10b981;"></div>
+              </div>
+            </div>
+
+            <div>
+              <div style="display: flex; justify-content: space-between; margin-bottom: 4px;">
+                <span style="font-size: 14px; color: #6b7280;">Stress</span>
+                <span style="font-size: 14px; font-weight: 600;">${this.stressLevel}/50</span>
+              </div>
+              <div style="height: 8px; background: #e5e7eb; border-radius: 4px; overflow: hidden;">
+                <div style="width: ${this.stressLevel * 2}%; height: 100%; background: ${this.stressLevel > 30 ? '#ef4444' : '#f59e0b'};"></div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Quick Actions -->
+          <div style="margin-bottom: 24px;">
+            <h3 style="margin: 0 0 12px 0; font-size: 16px; color: #374151;">Quick Actions</h3>
+            <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px;">
+              <button onclick="window.RoamFlowInstance.showSmartRecommendation()"
+                      style="padding: 12px; background: #0ea5e9; color: white; border: none; border-radius: 6px; cursor: pointer;">
+                🎯 What Now?
+              </button>
+              <button onclick="window.RoamFlowInstance.showStateUpdateDialog()"
+                      style="padding: 12px; background: #8b5cf6; color: white; border: none; border-radius: 6px; cursor: pointer;">
+                ⚡ Update State
+              </button>
+              <button onclick="window.RoamFlowInstance.refreshTasks()"
+                      style="padding: 12px; background: #10b981; color: white; border: none; border-radius: 6px; cursor: pointer;">
+                🔄 Refresh
+              </button>
+              <button onclick="window.RoamFlowInstance.showDiagnostics()"
+                      style="padding: 12px; background: #6b7280; color: white; border: none; border-radius: 6px; cursor: pointer;">
+                🔧 Diagnostics
+              </button>
+            </div>
+          </div>
+
+          <!-- Current Time Block -->
+          <div id="current-timeblock-section"></div>
+        </div>
+      `;
+    }
+
+    renderTaskList() {
+      if (!this.taskCache) {
+        this.fetchTasks().then(() => {
+          if (this.isInterfaceVisible && this.activeTab === 'tasks') {
+            this.renderInterface();
+          }
+        });
+        
+        return `
+          <div style="text-align: center; padding: 40px;">
+            <div style="font-size: 16px; margin-bottom: 8px;">🔄</div>
+            <div>Loading tasks...</div>
+          </div>
+        `;
+      }
+      
+      if (this.taskCache.length === 0) {
+        return `
+          <div style="text-align: center; padding: 40px;">
+            <div style="font-size: 16px; margin-bottom: 8px;">📝</div>
+            <div style="margin-bottom: 16px;">No tasks found</div>
+            <button class="bp3-button bp3-intent-primary" onclick="window.RoamFlowInstance.refreshTasks()">
+              🔄 Refresh Tasks
+            </button>
+          </div>
+        `;
+      }
+      
+      const validTasks = this.taskCache.filter(task => 
+        task && typeof task === 'object' && (task.title || task.rawText)
+      );
+      
+      const incompleteTasks = validTasks.filter(t => !t.completed);
+      const completedTasks = validTasks.filter(t => t.completed);
+      
+      // Apply current filter
+      const filteredTasks = this.filterTasks(incompleteTasks);
+      
+      // Sort tasks by current sort criteria
+      const sortedTasks = this.sortTasks(filteredTasks);
+      const displayTasks = sortedTasks.slice(0, 50);
+      
+      return `
+        <div style="height: 100%; display: flex; flex-direction: column;">
+          <!-- Header with controls -->
+          <div style="margin-bottom: 12px; padding-bottom: 8px; border-bottom: 1px solid #e2e8f0;">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+              <div style="font-weight: 600; color: #374151;">
+                ${filteredTasks.length}${this.taskFilter ? ' filtered' : ''} / ${incompleteTasks.length} active tasks
+                ${completedTasks.length > 0 ? `, ${completedTasks.length} completed` : ''}
+              </div>
+              <div style="display: flex; gap: 6px;">
+                <button class="bp3-button bp3-minimal bp3-small" onclick="window.RoamFlowInstance.refreshTasks()">
+                  🔄 Refresh
+                </button>
+                <button class="bp3-button bp3-minimal bp3-small" onclick="window.RoamFlowInstance.debugTaskCache()">
+                  🔍 Debug
+                </button>
+              </div>
+            </div>
+            
+            <!-- Filters -->
+            <div style="display: flex; gap: 6px; flex-wrap: wrap;">
+              <button class="bp3-button bp3-minimal bp3-small ${!this.taskFilter ? 'bp3-active' : ''}" 
+                      onclick="window.RoamFlowInstance.setTaskFilter(null)">
+                All
+              </button>
+              <button class="bp3-button bp3-minimal bp3-small ${this.taskFilter === 'high-priority' ? 'bp3-active' : ''}" 
+                      onclick="window.RoamFlowInstance.setTaskFilter('high-priority')">
+                High Priority
+              </button>
+              <button class="bp3-button bp3-minimal bp3-small ${this.taskFilter === 'due-soon' ? 'bp3-active' : ''}" 
+                      onclick="window.RoamFlowInstance.setTaskFilter('due-soon')">
+                Due Soon
+              </button>
+              <button class="bp3-button bp3-minimal bp3-small ${this.taskFilter === 'legal' ? 'bp3-active' : ''}" 
+                      onclick="window.RoamFlowInstance.setTaskFilter('legal')">
+                Legal
+              </button>
+            </div>
+          </div>
+          
+          <!-- Task Table -->
+          <div style="flex: 1; overflow: auto; border: 1px solid #e2e8f0; border-radius: 6px;">
+            <table style="width: 100%; border-collapse: collapse; font-size: 13px; background: white;">
+              <thead>
+                <tr style="background: #f8fafc; border-bottom: 2px solid #e2e8f0;">
+                  <th onclick="window.RoamFlowInstance.sortBy('task')" 
+                      style="padding: 8px 12px; text-align: left; font-weight: 600; cursor: pointer; min-width: 200px;">
+                    Task ${this.getSortIcon('task')}
+                  </th>
+                  <th onclick="window.RoamFlowInstance.sortBy('priority')" 
+                      style="padding: 8px 12px; text-align: left; font-weight: 600; cursor: pointer; width: 80px;">
+                    Priority ${this.getSortIcon('priority')}
+                  </th>
+                  <th onclick="window.RoamFlowInstance.sortBy('deadline')" 
+                      style="padding: 8px 12px; text-align: left; font-weight: 600; cursor: pointer; width: 100px;">
+                    Deadline ${this.getSortIcon('deadline')}
+                  </th>
+                  <th onclick="window.RoamFlowInstance.sortBy('context')" 
+                      style="padding: 8px 12px; text-align: left; font-weight: 600; cursor: pointer; width: 120px; ${window.innerWidth < 768 ? 'display: none;' : ''}">
+                    Context ${this.getSortIcon('context')}
+                  </th>
+                  <th onclick="window.RoamFlowInstance.sortBy('case')" 
+                      style="padding: 8px 12px; text-align: left; font-weight: 600; cursor: pointer; width: 120px; ${window.innerWidth < 768 ? 'display: none;' : ''}">
+                    Case ${this.getSortIcon('case')}
+                  </th>
+                  <th onclick="window.RoamFlowInstance.sortBy('time')" 
+                      style="padding: 8px 12px; text-align: left; font-weight: 600; cursor: pointer; width: 80px; ${window.innerWidth < 1024 ? 'display: none;' : ''}">
+                    Est. Time ${this.getSortIcon('time')}
+                  </th>
+                  <th onclick="window.RoamFlowInstance.sortBy('notes')" 
+                      style="padding: 8px 12px; text-align: left; font-weight: 600; cursor: pointer; width: 150px; ${window.innerWidth < 1024 ? 'display: none;' : ''}">
+                    Notes ${this.getSortIcon('notes')}
+                  </th>
+                  <th onclick="window.RoamFlowInstance.sortBy('modified')" 
+                      style="padding: 8px 12px; text-align: left; font-weight: 600; cursor: pointer; width: 90px; ${window.innerWidth < 1024 ? 'display: none;' : ''}">
+                    Modified ${this.getSortIcon('modified')}
+                  </th>
+                  <th onclick="window.RoamFlowInstance.sortBy('source')" 
+                      style="padding: 8px 12px; text-align: left; font-weight: 600; cursor: pointer; width: 100px; ${window.innerWidth < 1024 ? 'display: none;' : ''}">
+                    Source ${this.getSortIcon('source')}
+                  </th>
+                  <th style="padding: 8px 12px; text-align: left; font-weight: 600; width: 100px; ${window.innerWidth < 1024 ? 'display: none;' : ''}">
+                    Actions
+                  </th>
+                </tr>
+              </thead>
+              <tbody>
+                ${displayTasks.length === 0 ? `
+                  <tr>
+                    <td colspan="10" style="text-align: center; padding: 40px; color: #64748b;">
+                      ${this.taskFilter ? 'No tasks match current filter' : 'All tasks completed! 🎉'}
+                    </td>
+                  </tr>
+                ` : displayTasks.map((task, index) => this.renderTaskRow(task, index)).join('')}
+              </tbody>
+            </table>
+          </div>
+          
+          ${filteredTasks.length > 50 ? `
+            <div style="text-align: center; margin-top: 12px; padding: 8px; background: #f8fafc; border-radius: 4px; font-size: 12px; color: #64748b;">
+              Showing 50 of ${filteredTasks.length} ${this.taskFilter ? 'filtered' : ''} tasks
+            </div>
+          ` : ''}
+        </div>
+      `;
+    }
+
+    renderAnalytics() {
+      return `
+        <div>
+          <h3 style="margin: 0 0 12px 0; font-size: 16px; color: #374151;">Productivity Analytics</h3>
+          <p style="color: #6b7280;">Analytics coming soon...</p>
+        </div>
+      `;
+    }
+
+    // =============================================================================
+    // QUICK ACTION METHODS
+    // =============================================================================
+
+    async showSmartRecommendation() {
+      const recommendation = await this.getSmartRecommendation();
+      if (recommendation) {
+        this.showWhatToDoNowDialog(recommendation);
+      } else {
+        alert('No tasks available for recommendation');
+      }
+    }
+
+    async refreshTasks() {
+      this.taskCache = null;
+      await this.fetchTasks(true);
+      if (this.isInterfaceVisible && this.activeTab === 'tasks') {
+        this.renderInterface();
+      }
+      alert('✅ Tasks refreshed!');
+    }
+
+    showDiagnostics() {
+      if (window.RoamFlow.TaskDetection) {
+        const diagnostics = window.RoamFlow.TaskDetection.runDiagnostics();
+        this.showSystemCheckDialog(diagnostics);
+      }
+    }
+
+    // =============================================================================
+    // DIALOG METHODS (from command palette)
+    // =============================================================================
+
+    showWhatToDoNowDialog(recommendation) {
+      this.createDialog("🎯 What Should I Do Now?", () => {
+        const content = document.createElement('div');
+        
+        if (recommendation && recommendation.task) {
+          content.innerHTML = `
+            <div style="margin-bottom: 20px; padding: 16px; background: #f0f9ff; border-left: 4px solid #0ea5e9; border-radius: 4px;">
+              <h4 style="margin: 0 0 8px 0; color: #0369a1;">Recommended Task:</h4>
+              <p style="margin: 0; font-size: 16px;"><strong>${recommendation.task.title || recommendation.task.rawText}</strong></p>
+              ${recommendation.task.isTimeBlock ? `<p style="margin: 4px 0 0 0; color: #666; font-size: 14px;">⏰ ${recommendation.task.timeRange?.start} - ${recommendation.task.timeRange?.end}</p>` : ''}
+            </div>
+            
+            <div style="margin-bottom: 16px;">
+              <strong>Why this task?</strong>
+              <p style="margin: 8px 0;">${recommendation.reason}</p>
+            </div>
+            
+            <div style="margin-bottom: 20px;">
+              <strong>Task Score:</strong> <span style="font-size: 18px; color: #0ea5e9; font-weight: bold;">${Math.round((recommendation.task.score || 5) * 10)}</span>
+            </div>
+            
+            <div style="display: flex; gap: 12px;">
+              <button onclick="
+                if ('${recommendation.task.blockUID}') {
+                  window.roamAlphaAPI.ui.rightSidebar.addWindow({window: {type: 'outline', 'block-uid': '${recommendation.task.blockUID}'}});
+                }
+                document.getElementById('roamflow-dialog').remove();
+              " style="flex: 1; padding: 12px; background: #0ea5e9; color: white; border: none; border-radius: 4px; cursor: pointer;">
+                🎯 Go to Task
+              </button>
+              <button onclick="document.getElementById('roamflow-dialog').remove();" 
+                      style="flex: 1; padding: 12px; background: #64748b; color: white; border: none; border-radius: 4px; cursor: pointer;">
+                📊 Close
+              </button>
+            </div>
+          `;
+        } else {
+          content.innerHTML = `
+            <div style="text-align: center; padding: 20px;">
+              <p style="color: #64748b; margin: 0 0 16px 0;">No specific recommendation available right now.</p>
+              <button onclick="document.getElementById('roamflow-dialog').remove();" 
+                      style="padding: 12px 24px; background: #0ea5e9; color: white; border: none; border-radius: 4px; cursor: pointer;">
+                Close
+              </button>
+            </div>
+          `;
+        }
+        
+        return content;
+      });
+    }
+
+    showTaskScoreDialog(scoreResult, taskText) {
+      this.createDialog("🎯 Task Score Analysis", () => {
+        const content = document.createElement('div');
+        
+        const scoreColor = scoreResult.totalScore > 7 ? '#059669' : 
+                          scoreResult.totalScore > 4 ? '#d97706' : '#dc2626';
+        
+        content.innerHTML = `
+          <div style="margin-bottom: 20px; padding: 16px; background: #f8fafc; border-radius: 8px;">
+            <div style="font-weight: 600; margin-bottom: 8px;">Task:</div>
+            <div>${taskText}</div>
+          </div>
+          
+          <div style="text-align: center; margin-bottom: 24px;">
+            <div style="font-size: 48px; font-weight: bold; color: ${scoreColor};">
+              ${Math.round(scoreResult.totalScore * 10)}
+            </div>
+            <div style="color: #64748b; font-size: 14px;">Overall Priority Score</div>
+          </div>
+          
+          <button onclick="document.getElementById('roamflow-dialog').remove();" 
+                  style="width: 100%; padding: 12px; background: #0ea5e9; color: white; border: none; border-radius: 4px; cursor: pointer;">
+            Close
+          </button>
+        `;
+        
+        return content;
+      });
+    }
+
+    showRankedTasksDialog(rankedTasks) {
+      this.createDialog("📊 Tasks Ranked by Priority", () => {
+        const content = document.createElement('div');
+        
+        content.innerHTML = `
+          <div style="margin-bottom: 16px; padding: 12px; background: #f0f9ff; border-radius: 6px;">
+            <strong>Top ${Math.min(rankedTasks.length, 10)} Priority Tasks</strong>
+            <div style="font-size: 14px; color: #64748b; margin-top: 4px;">
+              Based on your current energy (${this.energyLevel}) and stress (${this.stressLevel}) levels
+            </div>
+          </div>
+          
+          <div style="max-height: 400px; overflow-y: auto;">
+            ${rankedTasks.slice(0, 10).map((task, index) => {
+              const scoreColor = task.score > 7 ? '#059669' : 
+                               task.score > 4 ? '#d97706' : '#dc2626';
+              
+              return `
+                <div style="margin: 8px 0; padding: 12px; border: 1px solid #e2e8f0; border-radius: 6px;">
+                  <div style="display: flex; justify-content: space-between; align-items: center;">
+                    <span style="font-weight: 600;">#${index + 1} ${task.title || task.rawText}</span>
+                    <span style="background: ${scoreColor}; color: white; padding: 4px 8px; border-radius: 12px; font-size: 12px;">
+                      ${Math.round(task.score * 10)}
+                    </span>
+                  </div>
+                </div>
+              `;
+            }).join('')}
+          </div>
+          
+          <button onclick="document.getElementById('roamflow-dialog').remove();" 
+                  style="width: 100%; margin-top: 16px; padding: 12px; background: #64748b; color: white; border: none; border-radius: 4px; cursor: pointer;">
+            Close
+          </button>
+        `;
+        
+        return content;
+      });
+    }
+
+    showActiveTimeBlockDialog(activeBlock) {
+      this.createDialog("⏰ Current Active Time Block", () => {
+        const content = document.createElement('div');
+        
+        const remainingMinutes = activeBlock.timeRemaining || 0;
+        
+        content.innerHTML = `
+          <div style="margin-bottom: 20px; padding: 16px; background: #ecfdf5; border-left: 4px solid #10b981; border-radius: 4px;">
+            <h4 style="margin: 0 0 8px 0; color: #065f46;">Currently Active:</h4>
+            <p style="margin: 0; font-size: 16px; font-weight: 600;">${activeBlock.taskDescription || 'Time Block'}</p>
+            <p style="margin: 4px 0 0 0; color: #064e3b;">⏰ ${activeBlock.timeRange?.start} - ${activeBlock.timeRange?.end}</p>
+          </div>
+          
+          <div style="margin-bottom: 16px;">
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+              <span>Time Remaining:</span>
+              <span style="font-size: 20px; font-weight: bold; color: ${remainingMinutes > 30 ? '#10b981' : remainingMinutes > 10 ? '#f59e0b' : '#ef4444'};">
+                ${remainingMinutes} minutes
+              </span>
+            </div>
+          </div>
+          
+          <button onclick="document.getElementById('roamflow-dialog').remove();" 
+                  style="width: 100%; padding: 12px; background: #10b981; color: white; border: none; border-radius: 4px; cursor: pointer;">
+            Close
+          </button>
+        `;
+        
+        return content;
+      });
+    }
+
+    showConflictDialog(conflicts) {
+      this.createDialog("⚠️ Schedule Conflicts", () => {
+        const content = document.createElement('div');
+        
+        content.innerHTML = `
+          <div style="margin-bottom: 16px;">
+            <p style="color: #dc2626; font-weight: 600;">Found ${conflicts.length} schedule conflict(s):</p>
+          </div>
+          
+          <div style="max-height: 300px; overflow-y: auto;">
+            ${conflicts.map(conflict => `
+              <div style="margin: 8px 0; padding: 12px; border: 1px solid #fee2e2; background: #fef2f2; border-radius: 6px;">
+                <div style="font-weight: 600; color: #dc2626;">
+                  ${conflict.timeRange?.start} - ${conflict.timeRange?.end}
+                </div>
+                <div style="font-size: 14px; color: #7f1d1d; margin-top: 4px;">
+                  ${conflict.taskDescription || 'Conflicting time block'}
+                </div>
+              </div>
+            `).join('')}
+          </div>
+          
+          <button onclick="document.getElementById('roamflow-dialog').remove();" 
+                  style="width: 100%; margin-top: 16px; padding: 12px; background: #dc2626; color: white; border: none; border-radius: 4px; cursor: pointer;">
+            Close
+          </button>
+        `;
+        
+        return content;
+      });
+    }
+
+    showStateUpdateDialog() {
+      this.createDialog("⚡ Update Energy & Stress Levels", () => {
+        const content = document.createElement('div');
+        
+        content.innerHTML = `
+          <div style="margin-bottom: 20px;">
+            <label style="display: block; margin-bottom: 8px; font-weight: 600;">
+              Energy Level: <span id="energy-display">${this.energyLevel}</span>/100
+            </label>
+            <input type="range" id="energy-slider" min="0" max="100" value="${this.energyLevel}" 
+                   style="width: 100%;" oninput="document.getElementById('energy-display').textContent = this.value">
+          </div>
+          
+          <div style="margin-bottom: 24px;">
+            <label style="display: block; margin-bottom: 8px; font-weight: 600;">
+              Stress Level: <span id="stress-display">${this.stressLevel}</span>/50
+            </label>
+            <input type="range" id="stress-slider" min="0" max="50" value="${this.stressLevel}" 
+                   style="width: 100%;" oninput="document.getElementById('stress-display').textContent = this.value">
+          </div>
+          
+          <button onclick="
+            const energy = parseInt(document.getElementById('energy-slider').value);
+            const stress = parseInt(document.getElementById('stress-slider').value);
+            window.RoamFlowInstance.energyLevel = energy;
+            window.RoamFlowInstance.stressLevel = stress;
+            window.RoamFlowInstance.saveMetrics();
+            alert('✅ Levels updated!');
+            document.getElementById('roamflow-dialog').remove();
+          " style="width: 100%; padding: 12px; background: #0ea5e9; color: white; border: none; border-radius: 4px; cursor: pointer;">
+            💾 Save Changes
+          </button>
+        `;
+        
+        return content;
+      });
+    }
+
+    showSystemCheckDialog(diagnostics) {
+      this.createDialog("🔧 System Diagnostics", () => {
+        const content = document.createElement('div');
+        
+        const allModulesLoaded = Object.keys(window.RoamFlow || {}).length >= 5;
+        const apiAvailable = diagnostics.roamApiAvailable;
+        
+        content.innerHTML = `
+          <div style="margin-bottom: 16px;">
+            <h4 style="margin: 0 0 12px 0;">Module Status</h4>
+            ${requiredModules.map(module => `
+              <div style="display: flex; justify-content: space-between; padding: 4px 0;">
+                <span>${module}</span>
+                <span style="color: ${window.RoamFlow?.[module] ? '#10b981' : '#dc2626'};">
+                  ${window.RoamFlow?.[module] ? '✓ Loaded' : '✗ Missing'}
+                </span>
+              </div>
+            `).join('')}
+          </div>
+          
+          <div style="margin-bottom: 16px;">
+            <h4 style="margin: 0 0 12px 0;">System Status</h4>
+            <div style="display: flex; justify-content: space-between; padding: 4px 0;">
+              <span>Roam API</span>
+              <span style="color: ${apiAvailable ? '#10b981' : '#f59e0b'};">
+                ${apiAvailable ? '✓ Available' : '⚠ Limited'}
+              </span>
+            </div>
+            <div style="display: flex; justify-content: space-between; padding: 4px 0;">
+              <span>Cache Size</span>
+              <span>${diagnostics.cacheStatus?.size || 0} items</span>
+            </div>
+            <div style="display: flex; justify-content: space-between; padding: 4px 0;">
+              <span>Visible Tasks</span>
+              <span>${diagnostics.visibleTasks || 0}</span>
+            </div>
+          </div>
+          
+          ${diagnostics.errors?.length > 0 ? `
+            <div style="margin-bottom: 16px;">
+              <h4 style="margin: 0 0 8px 0; color: #dc2626;">Errors</h4>
+              <div style="background: #fef2f2; padding: 8px; border-radius: 4px; font-size: 12px;">
+                ${diagnostics.errors.join('<br>')}
+              </div>
+            </div>
+          ` : ''}
+          
+          <button onclick="document.getElementById('roamflow-dialog').remove();" 
+                  style="width: 100%; padding: 12px; background: #64748b; color: white; border: none; border-radius: 4px; cursor: pointer;">
+            Close
+          </button>
+        `;
+        
+        return content;
+      });
+    }
+
+    createDialog(title, contentCreator) {
+      // Remove existing dialog
+      const existingDialog = document.getElementById('roamflow-dialog');
+      if (existingDialog) existingDialog.remove();
+      
+      const overlay = document.createElement('div');
+      overlay.id = 'roamflow-dialog';
+      overlay.style.cssText = `
+        position: fixed; top: 0; left: 0; right: 0; bottom: 0;
+        background: rgba(0,0,0,0.6); z-index: 10000;
+        display: flex; align-items: center; justify-content: center;
+        backdrop-filter: blur(2px);
+      `;
+      
+      const modal = document.createElement('div');
+      modal.style.cssText = `
+        background: white; border-radius: 12px; padding: 24px;
+        max-width: 500px; width: 90%; max-height: 80vh; overflow-y: auto;
+        box-shadow: 0 25px 50px -12px rgba(0,0,0,0.25);
+      `;
+      
+      const header = document.createElement('div');
+      header.style.cssText = 'display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;';
+      
+      const titleEl = document.createElement('h3');
+      titleEl.textContent = title;
+      titleEl.style.cssText = 'margin: 0; font-size: 18px; font-weight: 600; color: #1f2937;';
+      
+      const closeBtn = document.createElement('button');
+      closeBtn.textContent = '×';
+      closeBtn.style.cssText = `
+        border: none; background: #f3f4f6; font-size: 20px; cursor: pointer;
+        padding: 4px; width: 28px; height: 28px; border-radius: 6px;
+        color: #6b7280;
+      `;
+      closeBtn.onclick = () => overlay.remove();
+      
+      header.appendChild(titleEl);
+      header.appendChild(closeBtn);
+      
+      modal.appendChild(header);
+      modal.appendChild(contentCreator());
+      overlay.appendChild(modal);
+      
+      document.body.appendChild(overlay);
+      
+      // Close on overlay click
+      overlay.addEventListener('click', (e) => {
+        if (e.target === overlay) overlay.remove();
+      });
+    }
+
+    // =============================================================================
+    // COMMAND PALETTE REGISTRATION (include the enhanced version)
+    // =============================================================================
+
+    registerRoamCommands() {
+      try {
+        if (window.roamAlphaAPI?.ui?.commandPalette) {
+          
+          // Core Dashboard Access
+          window.roamAlphaAPI.ui.commandPalette.addCommand({
+            label: "🎯 RoamFlow Dashboard",
+            callback: () => this.toggleInterface(true)
+          });
+
+          window.roamAlphaAPI.ui.commandPalette.addCommand({
+            label: "📊 RoamFlow Analytics",
+            callback: () => {
+              this.toggleInterface(true);
+              this.setActiveTab('analytics');
+            }
+          });
+
+          // Smart Recommendations
+          window.roamAlphaAPI.ui.commandPalette.addCommand({
+            label: "⏰ What Should I Do Now?",
+            callback: async () => {
+              const context = { 
+                energyLevel: this.energyLevel, 
+                stressLevel: this.stressLevel,
+                currentTime: new Date()
+              };
+              
+              const recommendation = await this.getSmartRecommendation(context);
+              this.showWhatToDoNowDialog(recommendation);
+            }
+          });
+
+          window.roamAlphaAPI.ui.commandPalette.addCommand({
+            label: "🎯 Score Current Task",
+            callback: () => {
+              const focusedBlock = window.roamAlphaAPI.ui.getFocusedBlock();
+              if (focusedBlock?.["block-uid"] && window.RoamFlow?.PriorityScoringEngine) {
+                const blockText = this.getTextByBlockUid(focusedBlock["block-uid"]);
+                
+                if (blockText && blockText.includes("{{[[TODO]]}}")) {
+                  const task = window.RoamFlow.TaskDetection.parseTaskFromText(blockText);
+                  if (task) {
+                    const context = { 
+                      userState: {
+                        energyLevel: this.energyLevel, 
+                        stressLevel: this.stressLevel
+                      }
+                    };
+                    const scoreResult = window.RoamFlow.PriorityScoringEngine.calculateTaskScore(task, context);
+                    
+                    this.showTaskScoreDialog(scoreResult, blockText);
+                  }
+                } else {
+                  alert("Please focus on a TODO task to score.");
+                }
+              }
+            }
+          });
+
+          window.roamAlphaAPI.ui.commandPalette.addCommand({
+            label: "📊 Rank All Tasks by Priority",
+            callback: async () => {
+              if (window.RoamFlow?.TaskDetection && window.RoamFlow?.PriorityScoringEngine) {
+                const tasks = await window.RoamFlow.TaskDetection.getAllTasks();
+                const incompleteTasks = tasks.filter(t => !t.completed);
+                
+                const context = { 
+                  userState: {
+                    energyLevel: this.energyLevel, 
+                    stressLevel: this.stressLevel
+                  },
+                  currentTime: new Date()
+                };
+                
+                const rankedTasks = window.RoamFlow.PriorityScoringEngine.scoreAndRankTasks(incompleteTasks, context);
+                
+                this.showRankedTasksDialog(rankedTasks);
+              }
+            }
+          });
+
+          // Time Block Intelligence
+          window.roamAlphaAPI.ui.commandPalette.addCommand({
+            label: "🔍 Find Current Active Time Block",
+            callback: () => {
+              if (window.RoamFlow?.TimeBlockSystem) {
+                const activeBlock = window.RoamFlow.TimeBlockSystem.getCurrentActiveTimeBlock();
+                if (activeBlock) {
+                  this.showActiveTimeBlockDialog(activeBlock);
+                } else {
+                  alert("No active time block found for current time.");
+                }
+              }
+            }
+          });
+
+          window.roamAlphaAPI.ui.commandPalette.addCommand({
+            label: "⚠️ Check Schedule Conflicts",
+            callback: () => {
+              if (window.RoamFlow?.TimeBlockSystem) {
+                const timeBlocks = window.RoamFlow.TimeBlockSystem.getTimeBlocksForDate();
+                const conflicts = [];
+                
+                // Check for overlapping blocks
+                for (let i = 0; i < timeBlocks.length; i++) {
+                  for (let j = i + 1; j < timeBlocks.length; j++) {
+                    if (window.RoamFlow.TimeBlockSystem.timeBlocksOverlap(timeBlocks[i], timeBlocks[j])) {
+                      conflicts.push(timeBlocks[i], timeBlocks[j]);
+                    }
+                  }
+                }
+                
+                if (conflicts.length > 0) {
+                  this.showConflictDialog(conflicts);
+                } else {
+                  alert("✅ No schedule conflicts found for today!");
+                }
+              }
+            }
+          });
+
+          // State Management
+          window.roamAlphaAPI.ui.commandPalette.addCommand({
+            label: "⚡ Update Energy & Stress Levels",
+            callback: () => {
+              this.showStateUpdateDialog();
+            }
+          });
+
+          // System Utilities
+          window.roamAlphaAPI.ui.commandPalette.addCommand({
+            label: "🔧 RoamFlow System Check",
+            callback: () => {
+              if (window.RoamFlow?.TaskDetection) {
+                const diagnostics = window.RoamFlow.TaskDetection.runDiagnostics();
+                this.showSystemCheckDialog(diagnostics);
+              }
+            }
+          });
+
+          window.roamAlphaAPI.ui.commandPalette.addCommand({
+            label: "🔄 Refresh RoamFlow Data",
+            callback: () => {
+              this.fetchTasks(true);
+              alert("✅ RoamFlow data refreshed!");
+            }
+          });
+
+          console.log("RoamFlow: Command palette registered (10 commands)");
+          
+        } else {
+          console.log("RoamFlow: Command palette API not available");
+          
+          // Fallback keyboard shortcut
+          document.addEventListener('keydown', (e) => {
+            if (e.altKey && e.shiftKey && e.key === 'R') {
+              this.toggleInterface(true);
+              e.preventDefault();
+            }
+          });
+        }
+      } catch (error) {
+        console.error("RoamFlow: Error registering commands:", error);
+      }
+    }
+  }
+
+  // =============================================================================
+  // MODULE INITIALIZATION
+  // =============================================================================
+
+  // Initialize controller
+  const controller = new RoamFlowController();
+
+  // Export to RoamFlow namespace
+  window.RoamFlow.Controller = controller;
+  window.RoamFlow.MainController = RoamFlowController;
+
+  console.log('RoamFlow Module 7: Main Controller loaded successfully');
+  console.log('Command palette integration active');
+  console.log('UI system initialized');
+
+  return controller;
+
+})();
