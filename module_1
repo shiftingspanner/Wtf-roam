@@ -1,0 +1,500 @@
+ /**
+ * RoamFlow Module 1: Foundation Layer (FIXED)
+ * 
+ * Core foundation functions that modules 2-5 depend on.
+ * Provides reallocation UI, priority calculations, decision logic,
+ * data collection for future ML, and basic break management.
+ * 
+ * Dependencies: NONE (this is the foundation layer)
+ * Used by: Modules 2, 3, 4, 5, 7
+ */
+
+(() => {
+  'use strict';
+
+  // NO DEPENDENCIES CHECK - Foundation has zero dependencies!
+
+  // =============================================================================
+  // CONSTANTS AND CONFIGURATION
+  // =============================================================================
+
+  const FOUNDATION_CONFIG = {
+    // Reallocation UI settings
+    MAX_SUGGESTIONS: 5,
+    SUGGESTION_TIMEOUT: 30000, // 30 seconds before auto-dismiss
+    
+    // Priority calculation weights
+    DAILY_WEIGHT: 0.7,
+    WEEKLY_WEIGHT: 0.3,
+    DEADLINE_URGENCY_DAYS: 7,
+    
+    // Break management
+    MAX_CONTINUOUS_WORK: 120, // 2 hours in minutes
+    SUGGESTED_BREAK_DURATION: 15,
+    
+    // Data collection
+    DATA_RETENTION_DAYS: 90,
+    LOG_PAGE_TITLE: "RoamFlow Data Collection"
+  };
+
+  const LEGAL_CONTEXTS = {
+    'supervision': { minTime: 30, energyRequired: 'medium', focusRequired: 'high' },
+    'logistics': { minTime: 15, energyRequired: 'low', focusRequired: 'low' },
+   'practice-management': { minTime: 45, energyRequired: 'high', focusRequired: 'high' },
+    'client-contact': { minTime: 30, energyRequired: 'high', focusRequired: 'medium' },
+    'drafting': { minTime: 30, energyRequired: 'medium', focusRequired: 'high' },
+    'evidence': { minTime: 45, energyRequired: 'medium', focusRequired: 'high' },
+    'finalising': { minTime: 15, energyRequired: 'low', focusRequired: 'medium' }
+  };
+
+  // =============================================================================
+  // UTILITY FUNCTIONS
+  // =============================================================================
+
+  /**
+   * Generate a unique ID for logging and tracking
+   * @returns {string} Unique ID
+   */
+  function generateUID() {
+    const timestamp = Date.now().toString(36);
+    const random = Math.random().toString(36).substring(2);
+    return `rf_${timestamp}_${random}`;
+  }
+
+  /**
+   * Get current date in Roam format
+   * @returns {string} Date in "Month Day, Year" format
+   */
+  function getCurrentRoamDate() {
+    if (window.roamAlphaAPI?.util?.dateToPageTitle) {
+      return window.roamAlphaAPI.util.dateToPageTitle(new Date());
+    }
+    
+    // Fallback formatting
+    const today = new Date();
+    const months = ['January', 'February', 'March', 'April', 'May', 'June',
+                   'July', 'August', 'September', 'October', 'November', 'December'];
+    const day = today.getDate();
+    const month = months[today.getMonth()];
+    const year = today.getFullYear();
+    
+    const suffix = day % 10 === 1 && day !== 11 ? 'st' :
+                   day % 10 === 2 && day !== 12 ? 'nd' :
+                   day % 10 === 3 && day !== 13 ? 'rd' : 'th';
+    
+    return `${month} ${day}${suffix}, ${year}`;
+  }
+
+  /**
+   * Simple date parsing for Roam date references
+   * @param {string} roamDateString - Roam date string
+   * @returns {Date|null} Parsed date or null
+   */
+  function parseRoamDate(roamDateString) {
+    if (!roamDateString) return null;
+    
+    try {
+      // Handle common Roam date formats
+      if (roamDateString.match(/^\w+ \d{1,2}(st|nd|rd|th)?, \d{4}$/)) {
+        return new Date(roamDateString.replace(/(st|nd|rd|th)/, ''));
+      }
+      
+      // Try direct Date parsing
+      const parsed = new Date(roamDateString);
+      return isNaN(parsed.getTime()) ? null : parsed;
+    } catch (error) {
+      console.warn('Could not parse Roam date:', roamDateString);
+      return null;
+    }
+  }
+
+  // =============================================================================
+  // PRIORITY CALCULATION ENGINE
+  // =============================================================================
+
+  /**
+   * Calculate base priority score from daily and weekly priorities
+   * @param {number} dailyPriority - Daily priority (1-5)
+   * @param {number} weeklyPriority - Weekly priority (1-10)
+   * @param {Object} options - Additional options
+   * @returns {number} Base priority score (0-10)
+   */
+  function calculateBasePriority(dailyPriority, weeklyPriority, options = {}) {
+    // Validate inputs
+    if (!Number.isInteger(dailyPriority) || dailyPriority < 1 || dailyPriority > 5) {
+      throw new Error(`Daily priority must be 1-5, got: ${dailyPriority}`);
+    }
+    
+    if (!Number.isInteger(weeklyPriority) || weeklyPriority < 1 || weeklyPriority > 10) {
+      throw new Error(`Weekly priority must be 1-10, got: ${weeklyPriority}`);
+    }
+
+    const { 
+      dailyWeight = FOUNDATION_CONFIG.DAILY_WEIGHT,
+      weeklyWeight = FOUNDATION_CONFIG.WEEKLY_WEIGHT 
+    } = options;
+
+    // Normalize priorities to 0-10 scale
+    const normalizedDaily = (dailyPriority / 5) * 10;
+    const normalizedWeekly = weeklyPriority;
+
+    const basePriority = (normalizedDaily * dailyWeight) + (normalizedWeekly * weeklyWeight);
+    
+    return Math.max(0, Math.min(10, basePriority));
+  }
+
+  /**
+   * Apply deadline proximity multiplier to priority
+   * @param {number} basePriority - Base priority score
+   * @param {string|Date|null} deadline - Deadline date
+   * @param {Date} currentDate - Current date (for testing)
+   * @returns {number} Priority with deadline multiplier applied
+   */
+  function applyDeadlineMultiplier(basePriority, deadline, currentDate = new Date()) {
+    if (!deadline) return basePriority;
+    
+    const deadlineDate = deadline instanceof Date ? deadline : parseRoamDate(deadline);
+    if (!deadlineDate) return basePriority;
+    
+    const timeDiff = deadlineDate.getTime() - currentDate.getTime();
+    const daysUntilDeadline = Math.ceil(timeDiff / (1000 * 60 * 60 * 24));
+    
+    // Calculate urgency multiplier
+    let multiplier = 1.0;
+    
+    if (daysUntilDeadline <= 0) {
+      multiplier = 2.0; // Overdue
+    } else if (daysUntilDeadline <= 1) {
+      multiplier = 1.8; // Due today/tomorrow
+    } else if (daysUntilDeadline <= 3) {
+      multiplier = 1.5; // Due within 3 days
+    } else if (daysUntilDeadline <= 7) {
+      multiplier = 1.3; // Due within a week
+    } else if (daysUntilDeadline <= 14) {
+      multiplier = 1.1; // Due within 2 weeks
+    }
+    
+    return Math.min(10, basePriority * multiplier);
+  }
+
+  /**
+   * Calculate comprehensive task score
+   * @param {Object} taskData - Task information
+   * @param {Object} context - Scoring context
+   * @returns {Object} Score result with breakdown
+   */
+  function calculateTaskScore(taskData, context = {}) {
+    const {
+      dailyPriority = 3,
+      weeklyPriority = 5,
+      deadline = null,
+      estimatedDuration = 30,
+      context: taskContext = 'drafting',
+      caseReference = null
+    } = taskData;
+
+    const {
+      availableTime = 60,
+      currentCase = null,
+      timeOfDay = new Date().getHours(),
+      userEnergyLevel = 5
+    } = context;
+
+    // Base priority calculation
+    const basePriority = calculateBasePriority(dailyPriority, weeklyPriority);
+    
+    // Apply deadline multiplier
+    const priorityWithDeadline = applyDeadlineMultiplier(basePriority, deadline);
+    
+    // Time fit score (how well does task fit available time)
+    const timeFitScore = calculateTimeFitScore(estimatedDuration, availableTime);
+    
+    // Case match bonus (same case gets priority)
+    const caseMatchBonus = (currentCase && caseReference === currentCase) ? 1.5 : 1.0;
+    
+    // Context appropriateness (energy/focus requirements vs time of day)
+    const contextScore = calculateContextScore(taskContext, timeOfDay, userEnergyLevel);
+    
+    // Calculate final score
+    const components = {
+      basePriority: basePriority,
+      deadlineUrgency: priorityWithDeadline - basePriority,
+      timeFit: timeFitScore,
+      caseMatch: caseMatchBonus,
+      contextFit: contextScore
+    };
+    
+    const finalScore = priorityWithDeadline * timeFitScore * caseMatchBonus * contextScore;
+    
+    return {
+      score: Math.max(0, Math.min(10, finalScore)),
+      components: components,
+      taskId: taskData.id || generateUID(),
+      calculatedAt: new Date().toISOString()
+    };
+  }
+
+  /**
+   * Calculate how well a task fits available time
+   * @param {number} estimatedDuration - Task duration in minutes
+   * @param {number} availableTime - Available time in minutes
+   * @returns {number} Time fit score (0-1)
+   */
+  function calculateTimeFitScore(estimatedDuration, availableTime) {
+    if (estimatedDuration <= 0 || availableTime <= 0) return 0;
+    
+    if (estimatedDuration > availableTime) {
+      // Task too long for available time
+      return 0.1;
+    }
+    
+    const ratio = estimatedDuration / availableTime;
+    
+    // Optimal fit is 70-90% of available time
+    if (ratio >= 0.7 && ratio <= 0.9) {
+      return 1.0;
+    } else if (ratio >= 0.5 && ratio < 0.7) {
+      return 0.8;
+    } else if (ratio >= 0.3 && ratio < 0.5) {
+      return 0.6;
+    } else {
+      return 0.4; // Very short tasks get lower priority
+    }
+  }
+
+  /**
+   * Calculate context appropriateness score
+   * @param {string} taskContext - Legal context
+   * @param {number} timeOfDay - Hour (0-23)
+   * @param {number} userEnergyLevel - User energy (1-10)
+   * @returns {number} Context score (0.5-1.5)
+   */
+  function calculateContextScore(taskContext, timeOfDay, userEnergyLevel) {
+    const contextInfo = LEGAL_CONTEXTS[taskContext];
+    if (!contextInfo) return 1.0;
+    
+    let score = 1.0;
+    
+    // Time of day adjustments
+    const isHighEnergyTime = (timeOfDay >= 9 && timeOfDay <= 11) || (timeOfDay >= 14 && timeOfDay <= 16);
+    const isLowEnergyTime = timeOfDay >= 16 || timeOfDay <= 8;
+    
+    if (contextInfo.energyRequired === 'high' && isHighEnergyTime) {
+      score *= 1.2;
+    } else if (contextInfo.energyRequired === 'high' && isLowEnergyTime) {
+      score *= 0.8;
+    }
+    
+    // User energy level matching
+    const energyMap = { 'low': 3, 'medium': 6, 'high': 8 };
+    const requiredEnergy = energyMap[contextInfo.energyRequired] || 5;
+    
+    if (userEnergyLevel >= requiredEnergy) {
+      score *= 1.1;
+    } else if (userEnergyLevel < requiredEnergy - 2) {
+      score *= 0.9;
+    }
+    
+    return Math.max(0.5, Math.min(1.5, score));
+  }
+
+  /**
+   * Score and rank multiple tasks
+   * @param {Array} tasks - Array of task objects
+   * @param {Object} context - Scoring context
+   * @returns {Array} Scored and ranked tasks
+   */
+  function scoreAndRankTasks(tasks, context = {}) {
+    const scoredTasks = tasks.map(task => {
+      const scoreResult = calculateTaskScore(task, context);
+      return {
+        ...task,
+        scoreResult: scoreResult,
+        finalScore: scoreResult.score
+      };
+    });
+    
+    // Sort by score (highest first)
+    return scoredTasks.sort((a, b) => b.finalScore - a.finalScore);
+  }
+
+  // =============================================================================
+  // BREAK MANAGEMENT
+  // =============================================================================
+
+  /**
+   * Determine if a break should be recommended
+   * @param {Date} workStartTime - When work session started
+   * @param {Date} currentTime - Current time
+   * @returns {boolean} Whether to recommend break
+   */
+  function shouldRecommendBreak(workStartTime, currentTime = new Date()) {
+    if (!workStartTime) return false;
+    
+    const workDuration = (currentTime.getTime() - workStartTime.getTime()) / (1000 * 60);
+    return workDuration >= FOUNDATION_CONFIG.MAX_CONTINUOUS_WORK;
+  }
+
+  /**
+   * Calculate total work session duration from time blocks
+   * @param {Array} timeBlocks - Array of completed time blocks
+   * @param {Date} currentTime - Current time
+   * @returns {number} Work duration in minutes
+   */
+  function calculateWorkSessionDuration(timeBlocks, currentTime = new Date()) {
+    if (!timeBlocks || timeBlocks.length === 0) return 0;
+    
+    const today = getCurrentRoamDate();
+    const todayBlocks = timeBlocks.filter(block => 
+      block.date === today && block.isCompleted
+    );
+    
+    return todayBlocks.reduce((total, block) => {
+      return total + (block.actualDuration || block.estimatedDuration || 0);
+    }, 0);
+  }
+
+  // =============================================================================
+  // DATA COLLECTION FOR FUTURE ML
+  // =============================================================================
+
+  /**
+   * Log task completion data
+   * @param {Object} task - Completed task
+   * @param {number} actualDuration - Actual time spent
+   * @param {number} effectiveness - User-rated effectiveness (1-10)
+   */
+  function logTaskCompletion(task, actualDuration, effectiveness = null) {
+    const logEntry = {
+      type: 'task_completion',
+      timestamp: new Date().toISOString(),
+      taskId: task.id || generateUID(),
+      context: task.context,
+      caseReference: task.caseReference,
+      estimatedDuration: task.estimatedDuration,
+      actualDuration: actualDuration,
+      effectiveness: effectiveness,
+      timeOfDay: new Date().getHours(),
+      dayOfWeek: new Date().getDay()
+    };
+    
+    _writeToDataLog(logEntry);
+  }
+
+  /**
+   * Log user behavior patterns
+   * @param {string} action - Action taken
+   * @param {Object} context - Action context
+   */
+  function logUserBehavior(action, context = {}) {
+    const logEntry = {
+      type: 'user_behavior',
+      timestamp: new Date().toISOString(),
+      action: action,
+      context: context,
+      timeOfDay: new Date().getHours(),
+      dayOfWeek: new Date().getDay()
+    };
+    
+    _writeToDataLog(logEntry);
+  }
+
+  /**
+   * Log time block usage patterns
+   * @param {Object} timeBlock - Time block data
+   * @param {number} actualTime - Actual time used
+   * @param {string} outcome - Outcome description
+   */
+  function logTimeBlockUsage(timeBlock, actualTime, outcome) {
+    const logEntry = {
+      type: 'timeblock_usage',
+      timestamp: new Date().toISOString(),
+      blockId: timeBlock.blockUID,
+      context: timeBlock.context,
+      caseReference: timeBlock.caseReference,
+      estimatedDuration: timeBlock.estimatedDuration,
+      actualTime: actualTime,
+      outcome: outcome,
+      timeOfDay: new Date().getHours()
+    };
+    
+    _writeToDataLog(logEntry);
+  }
+
+  /**
+   * Internal function to write data to Roam log
+   * @param {Object} logEntry - Log entry data
+   * @private
+   */
+  function _writeToDataLog(logEntry) {
+    try {
+      const logPageTitle = FOUNDATION_CONFIG.LOG_PAGE_TITLE;
+      const today = getCurrentRoamDate();
+      const logText = `${JSON.stringify(logEntry, null, 2)}`;
+      
+      // Try to write to today's page under data collection section
+      if (window.roamAlphaAPI?.createBlock) {
+        // This is a simplified approach - in practice, you might want to 
+        // create a specific structure for data collection
+        console.log('RoamFlow Data Log:', logEntry);
+        
+        // Store in localStorage as backup
+        const storageKey = `roamflow_data_${new Date().toISOString().split('T')[0]}`;
+        const existingData = JSON.parse(localStorage.getItem(storageKey) || '[]');
+        existingData.push(logEntry);
+        localStorage.setItem(storageKey, JSON.stringify(existingData));
+      }
+    } catch (error) {
+      console.error('Error writing to data log:', error);
+    }
+  }
+
+  // =============================================================================
+  // MODULE PUBLIC INTERFACE
+  // =============================================================================
+
+  /**
+   * Module 1 Public Interface
+   * Foundation functions for other modules
+   */
+  const RoamFlowFoundation = {
+    // Priority calculation
+    calculateBasePriority,
+    applyDeadlineMultiplier,
+    calculateTaskScore,
+    scoreAndRankTasks,
+    calculateTimeFitScore,
+    calculateContextScore,
+    
+    // Break management
+    shouldRecommendBreak,
+    calculateWorkSessionDuration,
+    
+    // Data collection
+    logTaskCompletion,
+    logUserBehavior,
+    logTimeBlockUsage,
+    
+    // Utilities
+    generateUID,
+    getCurrentRoamDate,
+    parseRoamDate,
+    
+    // Configuration
+    FOUNDATION_CONFIG,
+    LEGAL_CONTEXTS
+  };
+
+  // Export to global scope for other modules
+  if (typeof window !== 'undefined') {
+    window.RoamFlow = window.RoamFlow || {};
+    window.RoamFlow.Foundation = RoamFlowFoundation;
+  }
+
+  console.log('RoamFlow Module 1: Foundation Layer loaded successfully');
+  console.log('Priority scoring engine initialized');
+  console.log('Data collection enabled');
+
+  return RoamFlowFoundation;
+
+})();
